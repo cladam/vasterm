@@ -1,0 +1,20 @@
+[package]
+name = "vasterm"
+version = "0.1.0-1"
+authors = ["Claes Adamsson <claes.adamsson@gmail.com>"]
+repository = "https://github.com/cladam/vasterm"
+readme = "README.md"
+license = "MIT"
+description = "Zoomable terminal emulator."
+keywords = ["cli", "terminal", "emulator", "zoom"]
+categories = ["development-tools"]
+edition = "2021"
+
+[dependencies]
+bevy = "0.13.2"
+alacritty_terminal = "0.22.0"
+portable-pty = "0.9.0"
+
+[lib]
+name = "vasterm"
+path = "src/lib.rs"
