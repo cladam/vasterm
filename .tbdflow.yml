@@ -1,6 +1,7 @@
 main_branch_name: main
-release_url_template: https://github.com/owner/repository/releases/tag/{{version}}
+release_url_template: https://github.com/cladam/vasterm/releases/tag/{{version}}
 stale_branch_threshold_days: 1
+log_display_count: 15
 monorepo:
   enabled: false
   project_dirs: []
@@ -28,16 +29,16 @@ radar:
   - '*-lock.*'
   - CHANGELOG.md
 ci_check:
-  enabled: false
+  enabled: true
 branch_types:
-  release: release_
-  feature: feature_
-  docs: docs/
-  feat: feat/
   refactor: refactor/
+  release: release/
+  feat: feat/
+  feature: feature/
   fix: fix/
   ci: ci/
   chore: chore/
+  docs: docs/
 automatic_tags:
   release_prefix: v
 lint:
