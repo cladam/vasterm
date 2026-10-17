@@ -1,26 +1,11 @@
 main_branch_name: main
 release_url_template: https://github.com/owner/repository/releases/tag/{{version}}
 stale_branch_threshold_days: 1
-<<<<<<< HEAD
-=======
-log_display_count: 15
->>>>>>> cb5c8fc (chore: Initialise tbdflow configuration)
 monorepo:
   enabled: false
   project_dirs: []
 issue_handling:
   strategy: branch-name
-<<<<<<< HEAD
-branch_types:
-  feature: feature_
-  chore: chore/
-  docs: docs/
-  feat: feat/
-  fix: fix/
-  release: release_
-  ci: ci/
-  refactor: refactor/
-=======
 review:
   enabled: false
   default_reviewers: []
@@ -53,7 +38,6 @@ branch_types:
   fix: fix/
   ci: ci/
   chore: chore/
->>>>>>> cb5c8fc (chore: Initialise tbdflow configuration)
 automatic_tags:
   release_prefix: v
 lint:
