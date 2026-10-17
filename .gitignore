@@ -21,4 +21,8 @@ target
 .idea/
 
 .DS_Store
+docs/vasterm.md
 
+
+# tbdflow intent log (local-only, never committed)
+.tbdflow-intent.json
