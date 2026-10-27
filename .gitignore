@@ -22,6 +22,9 @@ target
 
 .DS_Store
 docs/vasterm.md
+docs/development-plan.md
+docs/hica-feasibility.md
+.koka
 
 
 # tbdflow intent log (local-only, never committed)

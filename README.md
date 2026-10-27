@@ -1,3 +1,7 @@
-# ON HOLD
+# vasterm
 
-This idea is intriguing and I'd love to pursue it. Having multiple terminals on a canvas is interesting, will get to it eventually
+An exploration of a native, zoomable canvas for multiple terminal sessions.
+
+The implementation direction is Rust with egui/eframe, a custom terminal
+surface, and `alacritty_terminal`. 
+
