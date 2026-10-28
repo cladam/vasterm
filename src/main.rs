@@ -9,6 +9,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Vasterm",
         options,
-        Box::new(|_| Ok(Box::new(vasterm::VastermApp))),
+        Box::new(|context| Ok(Box::new(vasterm::VastermApp::new(&context.egui_ctx)))),
     )
 }

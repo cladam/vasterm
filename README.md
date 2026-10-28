@@ -13,7 +13,13 @@ The initial target is macOS. Install Rust 1.95 or newer, then run:
 cargo run --locked
 ```
 
-The current bootstrap opens a native window, but does not start a shell yet.
+The current app starts your `$SHELL` with `-i` on an 80x24 PTY, processes its
+output through the terminal emulator, and displays session status or errors.
+Use **Stop session** to terminate the owned shell, or close the window.
+Terminal text rendering and keyboard input are the next slice (M1.3), so this
+is not an interactive terminal yet. `$SHELL` must be set; startup errors are
+shown rather than silently choosing a different shell.
+
 See the [development plan and milestone log](docs/development-plan.md) for
 the plan-do-test-verify-reflect cycle, acceptance criteria, and progress.
 
