@@ -118,7 +118,7 @@ impl TerminalSurface {
                 }
             }
         } else {
-            self.input.preedit.clear();
+            self.input.reset();
         }
         let painter = ui.painter_at(rect);
         let cursor = paint(&painter, session.terminal(), rect, metrics, &font, focused);
@@ -374,6 +374,75 @@ mod tests {
         });
         output.textures_delta.clear();
         (output, cursor)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_font_fallback_supplies_real_unicode_glyphs_without_changing_cell_metrics() {
+        use std::sync::Arc;
+
+        let context = egui::Context::default();
+        let font = FontId::monospace(14.0);
+        let mut base_metrics = Vec2::ZERO;
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            ui.fonts_mut(|fonts| {
+                assert!(
+                    !fonts.has_glyph(&font, '界'),
+                    "this regression requires a glyph missing from bundled fonts"
+                );
+                base_metrics = egui::vec2(fonts.glyph_width(&font, 'M'), fonts.row_height(&font));
+            });
+        });
+        output.textures_delta.clear();
+        assert!(eframe::NativeOptions::default().system_font_fallback);
+        context.add_font_provider(Arc::new(
+            egui_system_font_provider::SystemFontProvider::new(),
+        ));
+        let term = terminal("界日本語é∑🙂".as_bytes());
+        let rect = Rect::from_min_size(egui::pos2(16.0, 32.0), egui::vec2(160.0, 64.0));
+        for scale in [1.0, 1.25, 2.0] {
+            context.set_pixels_per_point(scale);
+            let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+                ui.fonts_mut(|fonts| {
+                    for character in "界日本語é∑🙂".chars() {
+                        assert!(
+                            fonts.has_glyph(&font, character),
+                            "no real system glyph for {character:?}"
+                        );
+                    }
+                    assert!(
+                        !fonts.discovered_fonts().is_empty(),
+                        "coverage must come from system fonts"
+                    );
+                    let cell = egui::vec2(fonts.glyph_width(&font, 'M'), fonts.row_height(&font));
+                    assert_eq!(
+                        cell, base_metrics,
+                        "fallback must not change the base monospace grid"
+                    );
+                });
+                paint(
+                    &ui.painter_at(rect),
+                    &term,
+                    rect,
+                    Metrics::new(base_metrics, scale),
+                    &font,
+                    true,
+                );
+            });
+            for character in ['界', '日', '本', '語', 'é', '∑', '🙂'] {
+                assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                    egui::epaint::Shape::Text(text) if text.galley.text() == character.to_string()
+                        && text.galley.rows.iter().any(|row| !row.visuals.mesh.indices.is_empty()))),
+                    "glyph {character:?} must produce paintable triangles");
+            }
+            assert!(
+                output
+                    .shapes
+                    .iter()
+                    .all(|shape| rect.contains_rect(shape.clip_rect))
+            );
+            output.textures_delta.clear();
+        }
     }
 
     #[test]

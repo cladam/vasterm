@@ -21,13 +21,16 @@ to focus it. Use **Stop session** to terminate the owned shell, or close the
 window. `$SHELL` must be set; startup and interaction errors are shown rather
 than silently choosing a different shell or discarding failed input.
 
-M1.3 is implemented but awaits native shell, `vim`, resize, and display-scale
-verification. Rendering uses egui's bundled fonts: missing glyphs, CJK/emoji
-coverage, and combining-mark shaping remain limitations. Bold is synthesized,
+M1.3 drawing/input/resize is complete following user-confirmed native
+verification; M1.4 load/lifecycle is next. Rendering uses egui's bundled fonts with on-demand system-font
+fallback for missing glyphs, including CJK. Coverage depends on installed
+fonts; complex/combining-mark shaping remains a limitation. Bold is synthesized,
 underline variants use a single line, and the cursor is steady rather than
-blinking. Option-generated text follows the native keyboard layout; Command
-shortcuts are not sent as shell keys. Selection, clipboard/paste, scrollback
-navigation, and terminal mouse reporting remain deferred to M4.
+blinking. On macOS, **left Option is Meta** (e.g. Option+B/F sends Escape+b/f
+for shell word navigation); **right Option keeps native composed text** and
+dead keys. Command shortcuts are not sent as shell keys. Selection, clipboard/paste, scrollback
+navigation, and terminal mouse reporting remain deferred to M4. Pasting text
+copied from another application is not supported yet, including Command+V.
 
 See the [development plan and milestone log](docs/development-plan.md) for
 the plan-do-test-verify-reflect cycle, acceptance criteria, and progress.

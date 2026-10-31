@@ -4,9 +4,19 @@ use eframe::egui::{Event, ImeEvent, Key, Modifiers};
 #[derive(Default)]
 pub(crate) struct TerminalInput {
     pub preedit: String,
+    left_alt: bool,
 }
 
 impl TerminalInput {
+    pub fn reset(&mut self) {
+        self.preedit.clear();
+        self.left_alt = false;
+    }
+
+    fn meta(&self, modifiers: Modifiers) -> bool {
+        modifiers.alt && (!cfg!(target_os = "macos") || self.left_alt)
+    }
+
     pub fn encode(
         &mut self,
         events: &[Event],
@@ -19,6 +29,13 @@ impl TerminalInput {
             let bytes = match event {
                 Event::ModifiersChanged(value) => {
                     modifiers = *value;
+                    if !modifiers.alt {
+                        self.left_alt = false;
+                    }
+                    continue;
+                }
+                Event::WindowFocused(false) => {
+                    self.reset();
                     continue;
                 }
                 Event::Ime(ImeEvent::Preedit { text, .. }) => {
@@ -26,31 +43,41 @@ impl TerminalInput {
                     continue;
                 }
                 Event::Ime(ImeEvent::Commit(text)) => {
+                    let composing = !self.preedit.is_empty();
                     self.preedit.clear();
                     committed = Some(text);
-                    text.as_bytes().to_vec()
+                    if modifiers.mac_cmd {
+                        continue;
+                    }
+                    encode_text(text, self.meta(modifiers) && !composing)
                 }
                 Event::Text(text) if committed.take() == Some(text) => continue,
                 Event::Text(text)
                     if self.preedit.is_empty()
                         && !modifiers.mac_cmd
-                        && (!modifiers.ctrl || modifiers.alt) =>
+                        && (!modifiers.ctrl || (modifiers.alt && !self.meta(modifiers))) =>
                 {
-                    text.chars()
-                        .filter(|c| !c.is_control())
-                        .collect::<String>()
-                        .into_bytes()
+                    let text = text.chars().filter(|c| !c.is_control()).collect::<String>();
+                    encode_text(&text, self.meta(modifiers))
                 }
                 Event::Key {
                     key,
                     pressed,
                     modifiers: key_modifiers,
+                    physical_key,
                     ..
                 } => {
                     modifiers = *key_modifiers;
+                    if physical_key.unwrap_or(*key) == Key::AltLeft {
+                        self.left_alt = *pressed;
+                    }
                     committed = None;
                     if *pressed && self.preedit.is_empty() {
-                        encode_key(*key, modifiers, mode)
+                        let encoded_modifiers = Modifiers {
+                            alt: self.meta(modifiers),
+                            ..modifiers
+                        };
+                        encode_key(*key, encoded_modifiers, mode)
                     } else {
                         Vec::new()
                     }
@@ -63,6 +90,18 @@ impl TerminalInput {
         }
         output
     }
+}
+
+fn encode_text(text: &str, meta: bool) -> Vec<u8> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut bytes = Vec::with_capacity(text.len() + usize::from(meta));
+    if meta {
+        bytes.push(0x1b);
+    }
+    bytes.extend_from_slice(text.as_bytes());
+    bytes
 }
 
 fn encode_key(key: Key, modifiers: Modifiers, mode: TermMode) -> Vec<u8> {
@@ -307,5 +346,153 @@ mod tests {
                 "é".as_bytes().to_vec(),
             ],
         );
+    }
+
+    #[test]
+    fn meta_text_is_prefixed_once_and_preserves_case_unicode_and_repeats() {
+        let mut input = TerminalInput::default();
+        let alt_shift = Modifiers {
+            alt: true,
+            shift: true,
+            ..Modifiers::NONE
+        };
+        assert_eq!(
+            input.encode(
+                &[
+                    key(Key::AltLeft, Modifiers::NONE),
+                    Event::ModifiersChanged(Modifiers::ALT),
+                    key(Key::B, Modifiers::ALT),
+                    Event::Text("b".into()),
+                    key(Key::B, alt_shift),
+                    Event::Text("B".into()),
+                    key(Key::B, Modifiers::ALT),
+                    Event::Text("b".into()),
+                    Event::Text("界".into()),
+                ],
+                Modifiers::NONE,
+                TermMode::empty(),
+            ),
+            [
+                b"\x1bb".to_vec(),
+                b"\x1bB".to_vec(),
+                b"\x1bb".to_vec(),
+                "\x1b界".as_bytes().to_vec()
+            ],
+        );
+    }
+
+    #[test]
+    fn meta_control_keys_and_navigation_use_the_existing_encodings() {
+        let mut input = TerminalInput::default();
+        let control_alt = Modifiers {
+            ctrl: true,
+            alt: true,
+            ..Modifiers::NONE
+        };
+        assert_eq!(
+            input.encode(
+                &[
+                    key(Key::AltLeft, Modifiers::ALT),
+                    key(Key::C, control_alt),
+                    Event::Text("c".into()),
+                    key(Key::ArrowLeft, Modifiers::ALT),
+                    key(Key::Backspace, Modifiers::ALT),
+                ],
+                Modifiers::NONE,
+                TermMode::APP_CURSOR,
+            ),
+            [
+                b"\x1b\x03".to_vec(),
+                b"\x1b[1;3D".to_vec(),
+                b"\x1b\x7f".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn meta_ime_key_commits_are_prefixed_but_composition_is_not() {
+        let mut input = TerminalInput::default();
+        assert_eq!(
+            input.encode(
+                &[
+                    key(Key::AltLeft, Modifiers::ALT),
+                    Event::Ime(ImeEvent::Commit("b".into())),
+                    Event::Text("b".into()),
+                    Event::Ime(ImeEvent::Preedit {
+                        text: "candidate".into(),
+                        active_range_chars: None
+                    }),
+                    Event::Ime(ImeEvent::Commit("é".into())),
+                    Event::Text("é".into()),
+                ],
+                Modifiers::NONE,
+                TermMode::empty(),
+            ),
+            [b"\x1bb".to_vec(), "é".as_bytes().to_vec()]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn right_option_keeps_composed_text_without_a_meta_prefix() {
+        let mut input = TerminalInput::default();
+        assert_eq!(
+            input.encode(
+                &[
+                    key(Key::AltRight, Modifiers::ALT),
+                    key(Key::B, Modifiers::ALT),
+                    Event::Text("∫".into()),
+                    Event::Ime(ImeEvent::Preedit {
+                        text: "´".into(),
+                        active_range_chars: None
+                    }),
+                    Event::Ime(ImeEvent::Commit("é".into())),
+                ],
+                Modifiers::NONE,
+                TermMode::empty(),
+            ),
+            ["∫".as_bytes().to_vec(), "é".as_bytes().to_vec()]
+        );
+    }
+
+    #[test]
+    fn releasing_meta_or_losing_focus_does_not_leave_it_stuck() {
+        let mut input = TerminalInput::default();
+        input.encode(
+            &[key(Key::AltLeft, Modifiers::ALT)],
+            Modifiers::NONE,
+            TermMode::empty(),
+        );
+        let release = Event::Key {
+            key: Key::AltLeft,
+            physical_key: Some(Key::AltLeft),
+            pressed: false,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        assert_eq!(
+            input.encode(
+                &[release, Event::Text("b".into())],
+                Modifiers::NONE,
+                TermMode::empty(),
+            ),
+            [b"b".to_vec()]
+        );
+        input.encode(
+            &[key(Key::AltLeft, Modifiers::ALT)],
+            Modifiers::NONE,
+            TermMode::empty(),
+        );
+        input.reset();
+        assert!(!input.left_alt);
+        input.encode(
+            &[
+                key(Key::AltLeft, Modifiers::ALT),
+                Event::WindowFocused(false),
+            ],
+            Modifiers::NONE,
+            TermMode::empty(),
+        );
+        assert!(!input.left_alt);
     }
 }

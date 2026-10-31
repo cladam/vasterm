@@ -9,6 +9,18 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Vasterm",
         options,
-        Box::new(|context| Ok(Box::new(vasterm::VastermApp::new(&context.egui_ctx)))),
+        Box::new(|context| {
+            #[cfg(target_os = "macos")]
+            {
+                use winit::platform::macos::{OptionAsAlt, WindowExtMacOS};
+                let window = context.winit_window().ok_or_else(|| {
+                    std::io::Error::other(
+                        "native window unavailable; cannot configure Option-as-Meta",
+                    )
+                })?;
+                window.set_option_as_alt(OptionAsAlt::OnlyLeft);
+            }
+            Ok(Box::new(vasterm::VastermApp::new(&context.egui_ctx)))
+        }),
     )
 }

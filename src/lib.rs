@@ -143,7 +143,7 @@ mod tests {
     fn focused_surface_delivers_text_ime_and_mode_aware_keys_to_the_child() {
         use egui::{Event, ImeEvent, Key, Modifiers};
         use portable_pty::CommandBuilder;
-        let expected = b"a\xc3\xa9\x03\x1bOA\r\x7f\t\x1b\x1bOH\x1bOF\x04";
+        let expected = b"a\xc3\xa9\x03\x1bOA\r\x7f\t\x1b\x1bOH\x1bOF\x1bb\x1bf\x04";
         let mut command = CommandBuilder::new("/bin/sh");
         command.args([
             "-c",
@@ -207,6 +207,18 @@ mod tests {
                 key(Key::Escape, Modifiers::NONE),
                 key(Key::Home, Modifiers::NONE),
                 key(Key::End, Modifiers::NONE),
+                key(Key::AltLeft, Modifiers::ALT),
+                key(Key::B, Modifiers::ALT),
+                Event::Text("b".into()),
+                key(Key::F, Modifiers::ALT),
+                Event::Text("f".into()),
+                Event::Key {
+                    key: Key::AltLeft,
+                    physical_key: Some(Key::AltLeft),
+                    pressed: false,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                },
                 key(Key::D, Modifiers::CTRL),
             ],
             true,
