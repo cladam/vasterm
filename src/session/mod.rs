@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail, ensure};
 use portable_pty::{CommandBuilder, ExitStatus};
 
 use terminal::TerminalState;
-pub use terminal::{GridSize, SCROLLBACK_LINES, TerminalEvents, default_color};
+pub use terminal::{GridSize, SCROLLBACK_LINES, TerminalEvents, TerminalSize, default_color};
 use transport::Output;
 
 pub const MAX_INPUT_BYTES: usize = 4_096;
@@ -70,6 +70,8 @@ pub struct Session {
     state: SessionState,
     size: GridSize,
     input: SyncSender<Vec<u8>>,
+    resize: SyncSender<TerminalSize>,
+    resizing: bool,
     output: Receiver<Output>,
     cancelled: Arc<AtomicBool>,
     child_exited: Arc<AtomicBool>,
@@ -82,6 +84,7 @@ impl Session {
     pub fn spawn(mut command: CommandBuilder, size: GridSize, wakeup: Wakeup) -> Result<Self> {
         configure_environment(&mut command);
         let (input, input_rx) = mpsc::sync_channel(QUEUE_CHUNKS);
+        let (resize, resize_rx) = mpsc::sync_channel(1);
         let (output_tx, output) = mpsc::sync_channel(QUEUE_CHUNKS);
         let cancelled = Arc::new(AtomicBool::new(false));
         let child_exited = Arc::new(AtomicBool::new(false));
@@ -94,7 +97,7 @@ impl Session {
                 let result = transport::run(
                     command,
                     size,
-                    input_rx,
+                    (input_rx, resize_rx),
                     &output_tx,
                     &worker_cancelled,
                     &worker_child_exited,
@@ -111,6 +114,8 @@ impl Session {
             state: SessionState::Starting,
             size,
             input,
+            resize,
+            resizing: false,
             output,
             cancelled,
             child_exited,
@@ -129,6 +134,25 @@ impl Session {
 
     pub fn terminal(&self) -> &Term<TerminalEvents> {
         &self.terminal.core
+    }
+
+    /// Requests a worker-side resize. The model changes only after PTY success.
+    /// While a resize is in flight, callers should retry their latest dimensions.
+    pub fn resize(&mut self, size: TerminalSize) -> Result<()> {
+        size.pty_size()?;
+        if self.resizing || size == self.terminal.size {
+            return Ok(());
+        }
+        ensure!(
+            matches!(
+                self.state,
+                SessionState::Starting | SessionState::Running { .. }
+            ),
+            "cannot resize an inactive session"
+        );
+        self.resize.try_send(size).context("queue PTY resize")?;
+        self.resizing = true;
+        Ok(())
     }
 
     /// Accepts one bounded input message, or returns an error without queuing any of it.
@@ -172,6 +196,14 @@ impl Session {
                         })
                     {
                         self.fail(format!("{error:#}"));
+                    }
+                }
+                Ok(Output::Resized(size)) => {
+                    self.resizing = false;
+                    if !matches!(self.state, SessionState::Failed(_) | SessionState::Closed) {
+                        self.terminal.core.resize(size.grid);
+                        self.terminal.size = size;
+                        self.size = size.grid;
                     }
                 }
                 Ok(Output::Exited(status)) => {
@@ -263,6 +295,7 @@ mod tests {
 
     fn test_session() -> (Session, Receiver<Vec<u8>>, SyncSender<Output>) {
         let (input, input_rx) = mpsc::sync_channel(QUEUE_CHUNKS);
+        let (resize, _resize_rx) = mpsc::sync_channel(1);
         let (output_tx, output) = mpsc::sync_channel(QUEUE_CHUNKS);
         let size = GridSize::default();
         (
@@ -271,6 +304,8 @@ mod tests {
                 state: SessionState::Running { pid: 1 },
                 size,
                 input,
+                resize,
+                resizing: false,
                 output,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 child_exited: Arc::new(AtomicBool::new(false)),
@@ -305,6 +340,71 @@ mod tests {
         session.poll();
         assert!(matches!(session.state(), SessionState::Failed(message)
             if message.contains("read PTY output: injected I/O failure")));
+    }
+
+    #[test]
+    fn resize_changes_the_model_only_on_acknowledgment() {
+        let (mut session, _input, output) = test_session();
+        let (resize, requests) = mpsc::sync_channel(1);
+        session.resize = resize;
+        let size = TerminalSize {
+            grid: GridSize::new(90, 30).unwrap(),
+            cell_width: 9,
+            cell_height: 18,
+        };
+        session.resize(size).unwrap();
+        assert_eq!(requests.recv().unwrap(), size);
+        assert_eq!(session.size(), GridSize::default());
+        let latest = TerminalSize {
+            cell_width: 18,
+            ..size
+        };
+        session.resize(latest).unwrap();
+        assert!(
+            requests.try_recv().is_err(),
+            "only one resize may be in flight"
+        );
+        output.send(Output::Resized(size)).unwrap();
+        session.poll();
+        assert_eq!(session.size(), size.grid);
+        assert_eq!(session.terminal.size, size);
+        session.resize(latest).unwrap();
+        assert_eq!(
+            requests.recv().unwrap(),
+            latest,
+            "scale-only changes reach the PTY"
+        );
+        output.send(Output::Resized(latest)).unwrap();
+        session.poll();
+        session.resize(latest).unwrap();
+        assert!(
+            requests.try_recv().is_err(),
+            "unchanged dimensions do not cause resize loops"
+        );
+    }
+
+    #[test]
+    fn invalid_resize_is_rejected_and_worker_resize_errors_are_visible() {
+        let (mut session, _input, _output) = test_session();
+        let before = session.size();
+        assert!(
+            session
+                .resize(TerminalSize {
+                    grid: before,
+                    cell_width: u16::MAX,
+                    cell_height: 16,
+                })
+                .is_err()
+        );
+        session.worker = Some(thread::spawn(|| bail!("resize PTY: injected I/O failure")));
+        while !session.worker.as_ref().unwrap().is_finished() {
+            thread::yield_now();
+        }
+        session.poll();
+        assert!(
+            matches!(session.state(), SessionState::Failed(message) if message.contains("resize PTY"))
+        );
+        assert_eq!(session.size(), before);
     }
 
     #[test]

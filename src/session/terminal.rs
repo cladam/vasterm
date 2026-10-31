@@ -18,6 +18,33 @@ pub struct GridSize {
     rows: u16,
 }
 
+/// Grid and physical cell dimensions shared by the emulator and PTY.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerminalSize {
+    pub grid: GridSize,
+    pub cell_width: u16,
+    pub cell_height: u16,
+}
+
+impl TerminalSize {
+    pub(super) fn pty_size(self) -> Result<portable_pty::PtySize> {
+        Ok(portable_pty::PtySize {
+            rows: self.grid.rows(),
+            cols: self.grid.columns(),
+            pixel_width: self
+                .grid
+                .columns()
+                .checked_mul(self.cell_width)
+                .ok_or_else(|| anyhow::anyhow!("terminal pixel width exceeds PTY limit"))?,
+            pixel_height: self
+                .grid
+                .rows()
+                .checked_mul(self.cell_height)
+                .ok_or_else(|| anyhow::anyhow!("terminal pixel height exceeds PTY limit"))?,
+        })
+    }
+}
+
 impl GridSize {
     pub fn new(columns: u16, rows: u16) -> Result<Self> {
         ensure!(columns >= 2, "a terminal needs at least two columns");
@@ -73,6 +100,7 @@ impl EventListener for TerminalEvents {
 
 pub(super) struct TerminalState {
     pub core: Term<TerminalEvents>,
+    pub size: TerminalSize,
     parser: Processor,
     events: TerminalEvents,
 }
@@ -88,6 +116,10 @@ impl TerminalState {
         };
         Self {
             core: Term::new(config, &size, events.clone()),
+            size: TerminalSize {
+                grid: size,
+                ..TerminalSize::default()
+            },
             parser: Processor::new(),
             events,
         }
@@ -115,9 +147,8 @@ impl TerminalState {
                     Event::TextAreaSizeRequest(format) => format(WindowSize {
                         num_lines: self.core.screen_lines() as u16,
                         num_cols: self.core.columns() as u16,
-                        // No terminal surface exists yet, matching the PTY's unknown pixel size.
-                        cell_width: 0,
-                        cell_height: 0,
+                        cell_width: self.size.cell_width,
+                        cell_height: self.size.cell_height,
                     }),
                     _ => unreachable!("only protocol response events are queued"),
                 };
@@ -157,6 +188,16 @@ pub fn default_color(index: usize) -> Option<Rgb> {
         }
         256 | 258 => 0xe5e5e5,
         257 => 0x000000,
+        259..=266 | 268 => {
+            let base = if index == 268 {
+                0xe5e5e5
+            } else {
+                ANSI[index - 259]
+            };
+            let dim = |shift: u32| (((base >> shift) & 0xff_u32) * 2 / 3) << shift;
+            dim(16) | dim(8) | dim(0)
+        }
+        267 => 0xffffff,
         _ => return None,
     };
     Some(Rgb {

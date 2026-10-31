@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
 use portable_pty::CommandBuilder;
-use vasterm::session::{GridSize, Session, SessionState};
+use vasterm::session::{GridSize, Session, SessionState, TerminalSize};
 
 fn fixture(scenario: &str) -> Session {
     let mut command = CommandBuilder::new(std::env::current_exe().unwrap());
@@ -91,6 +91,30 @@ fn child_receives_initial_grid_and_truthful_environment() {
         matches!(s.state(), SessionState::Exited(_))
     });
     assert!(screen(&session).contains("ENVIRONMENT_OK"));
+    assert!(matches!(session.state(), SessionState::Exited(status) if status.success()));
+}
+
+#[test]
+fn resize_agrees_with_kernel_grid_and_emulator_pixel_queries() {
+    let mut session = fixture("resize");
+    wait_for(&mut session, |s| screen(s).contains("READY"));
+    let size = TerminalSize {
+        grid: GridSize::new(100, 30).unwrap(),
+        cell_width: 8,
+        cell_height: 16,
+    };
+    session.resize(size).unwrap();
+    assert_eq!(
+        session.size(),
+        GridSize::default(),
+        "resize is not yet acknowledged"
+    );
+    wait_for(&mut session, |s| s.size() == size.grid);
+    session.send_input(b"x").unwrap();
+    wait_for(&mut session, |s| {
+        matches!(s.state(), SessionState::Exited(_))
+    });
+    assert!(screen(&session).contains("RESIZE_OK"));
     assert!(matches!(session.state(), SessionState::Exited(status) if status.success()));
 }
 
@@ -301,6 +325,28 @@ fn pty_child_fixture() {
                 assert_eq!((size.ws_col, size.ws_row), (80, 24));
             }
             stdout.write_all(b"ENVIRONMENT_OK").unwrap();
+        }
+        "resize" => {
+            stdout.write_all(b"READY").unwrap();
+            stdout.flush().unwrap();
+            let mut input = [0];
+            io::stdin().read_exact(&mut input).unwrap();
+            assert_eq!(input, *b"x");
+            let mut size = std::mem::MaybeUninit::<libc::winsize>::uninit();
+            // Query this fixture's owned PTY slave after the UI-side acknowledgment.
+            unsafe {
+                assert_eq!(libc::ioctl(0, libc::TIOCGWINSZ, size.as_mut_ptr()), 0);
+                let size = size.assume_init();
+                assert_eq!((size.ws_col, size.ws_row), (100, 30));
+                assert_eq!((size.ws_xpixel, size.ws_ypixel), (800, 480));
+            }
+            stdout.write_all(b"\x1b[18t\x1b[14t").unwrap();
+            stdout.flush().unwrap();
+            let expected = b"\x1b[8;30;100t\x1b[4;480;800t";
+            let mut response = vec![0; expected.len()];
+            io::stdin().read_exact(&mut response).unwrap();
+            assert_eq!(response, expected);
+            stdout.write_all(b"\r\nRESIZE_OK").unwrap();
         }
         "query-burst" => {
             stdout.write_all(&b"\x1b[6n".repeat(1_000)).unwrap();

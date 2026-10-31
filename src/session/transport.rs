@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 
-use super::{GridSize, MAX_INPUT_BYTES, Wakeup};
+use super::{GridSize, MAX_INPUT_BYTES, TerminalSize, Wakeup};
 
 pub(super) const CHUNK_BYTES: usize = 4_096;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -16,20 +16,28 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 pub(super) enum Output {
     Started(u32),
     Bytes(Vec<u8>),
+    Resized(TerminalSize),
     Exited(ExitStatus),
 }
 
 pub(super) fn run(
     command: CommandBuilder,
     size: GridSize,
-    input: Receiver<Vec<u8>>,
+    commands: (Receiver<Vec<u8>>, Receiver<TerminalSize>),
     output: &SyncSender<Output>,
     cancelled: &AtomicBool,
     child_exited: &AtomicBool,
     wakeup: &Wakeup,
 ) -> Result<ExitStatus> {
     let mut process = PtyProcess::spawn(command, size)?;
-    let result = process.transfer(input, output, cancelled, child_exited, wakeup);
+    let result = process.transfer(
+        commands.0,
+        commands.1,
+        output,
+        cancelled,
+        child_exited,
+        wakeup,
+    );
     let cleanup = process.stop();
     if cleanup.is_ok() {
         child_exited.store(true, Ordering::Release);
@@ -85,6 +93,7 @@ impl PtyProcess {
     fn transfer(
         &mut self,
         input: Receiver<Vec<u8>>,
+        resize: Receiver<TerminalSize>,
         output: &SyncSender<Output>,
         cancelled: &AtomicBool,
         child_exited: &AtomicBool,
@@ -127,6 +136,18 @@ impl PtyProcess {
                 self.exit_status = self.child.try_wait().context("check session child exit")?;
                 if self.exit_status.is_some() {
                     child_exited.store(true, Ordering::Release);
+                }
+            }
+
+            if pending_output.is_none() && self.exit_status.is_none() {
+                match resize.try_recv() {
+                    Ok(size) => {
+                        self.master.resize(size.pty_size()?).context("resize PTY")?;
+                        pending_output = Some(Output::Resized(size));
+                        continue;
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => bail!("session resize sender disconnected"),
                 }
             }
 
