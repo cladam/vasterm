@@ -1,3 +1,4 @@
+mod diagnostics;
 mod terminal;
 mod transport;
 
@@ -12,14 +13,16 @@ use alacritty_terminal::Term;
 use anyhow::{Context, Result, bail, ensure};
 use portable_pty::{CommandBuilder, ExitStatus};
 
+pub use diagnostics::SessionDiagnostics;
+use diagnostics::WorkerDiagnostics;
 use terminal::TerminalState;
 pub use terminal::{GridSize, SCROLLBACK_LINES, TerminalEvents, TerminalSize, default_color};
 use transport::Output;
 
 pub const MAX_INPUT_BYTES: usize = 4_096;
 pub const QUEUE_CHUNKS: usize = 32;
-const UPDATE_BYTES: usize = 64 * 1_024;
-const UPDATE_TIME: Duration = Duration::from_millis(4);
+pub const UPDATE_BYTES: usize = 64 * 1_024;
+pub const UPDATE_TIME: Duration = Duration::from_millis(4);
 /// Schedule UI work promptly; the callback also runs on the PTY worker.
 pub type Wakeup = Arc<dyn Fn() + Send + Sync>;
 
@@ -69,14 +72,18 @@ pub struct Session {
     terminal: TerminalState,
     state: SessionState,
     size: GridSize,
-    input: SyncSender<Vec<u8>>,
+    input: SyncSender<transport::Input>,
     resize: SyncSender<TerminalSize>,
     resizing: bool,
     output: Receiver<Output>,
+    pending_bytes: Option<(Vec<u8>, usize)>,
     cancelled: Arc<AtomicBool>,
     child_exited: Arc<AtomicBool>,
     worker: Option<JoinHandle<Result<ExitStatus>>>,
     wakeup: Wakeup,
+    started_at: Instant,
+    diagnostics: SessionDiagnostics,
+    worker_diagnostics: Arc<WorkerDiagnostics>,
 }
 
 impl Session {
@@ -91,6 +98,9 @@ impl Session {
         let worker_cancelled = cancelled.clone();
         let worker_child_exited = child_exited.clone();
         let worker_wakeup = wakeup.clone();
+        let started_at = Instant::now();
+        let worker_diagnostics = Arc::new(WorkerDiagnostics::default());
+        let measurements = worker_diagnostics.clone();
         let worker = thread::Builder::new()
             .name("vasterm-pty".into())
             .spawn(move || {
@@ -99,12 +109,17 @@ impl Session {
                     size,
                     (input_rx, resize_rx),
                     &output_tx,
-                    &worker_cancelled,
-                    &worker_child_exited,
-                    &worker_wakeup,
+                    &transport::WorkerContext {
+                        cancelled: &worker_cancelled,
+                        child_exited: &worker_child_exited,
+                        wakeup: &worker_wakeup,
+                        diagnostics: &measurements,
+                        started_at,
+                    },
                 );
                 // Disconnection means all PTY work and cleanup have finished.
                 drop(output_tx);
+                diagnostics::increment(&measurements.wakeups);
                 worker_wakeup();
                 result
             })
@@ -117,10 +132,14 @@ impl Session {
             resize,
             resizing: false,
             output,
+            pending_bytes: None,
             cancelled,
             child_exited,
             worker: Some(worker),
             wakeup,
+            started_at,
+            diagnostics: SessionDiagnostics::default(),
+            worker_diagnostics,
         })
     }
 
@@ -134,6 +153,14 @@ impl Session {
 
     pub fn terminal(&self) -> &Term<TerminalEvents> {
         &self.terminal.core
+    }
+
+    /// Samples counters without requesting repaint or retaining terminal/input contents.
+    pub fn diagnostics(&self) -> SessionDiagnostics {
+        self.worker_diagnostics.snapshot(SessionDiagnostics {
+            elapsed: self.started_at.elapsed(),
+            ..self.diagnostics
+        })
     }
 
     /// Requests a worker-side resize. The model changes only after PTY success.
@@ -165,37 +192,66 @@ impl Session {
             !self.child_exited.load(Ordering::Acquire),
             "session child has exited"
         );
-        enqueue_input(&self.input, bytes)
+        enqueue_input(&self.input, bytes, Some(Instant::now()))
     }
 
     /// Updates UI-owned state with a soft time budget checked between output chunks.
     pub fn poll(&mut self) {
-        let start = Instant::now();
+        self.poll_with_clock(Instant::now);
+    }
+
+    fn poll_with_clock(&mut self, mut now: impl FnMut() -> Instant) {
+        let start = now();
         let mut processed = 0;
         let mut disconnected = false;
-        while processed < UPDATE_BYTES && start.elapsed() < UPDATE_TIME {
-            match self.output.try_recv() {
+        let mut budget_exhausted = false;
+        loop {
+            if processed >= UPDATE_BYTES || now().duration_since(start) >= UPDATE_TIME {
+                budget_exhausted = true;
+                break;
+            }
+            let (event, offset) = if let Some((bytes, offset)) = self.pending_bytes.take() {
+                (Ok(Output::Bytes(bytes)), offset)
+            } else {
+                (self.output.try_recv(), 0)
+            };
+            match event {
                 Ok(Output::Started(pid)) => {
                     if !matches!(self.state, SessionState::Failed(_) | SessionState::Closed) {
                         self.state = SessionState::Running { pid };
                     }
                 }
                 Ok(Output::Bytes(bytes)) => {
-                    processed += bytes.len();
+                    if bytes.len() > transport::CHUNK_BYTES {
+                        self.fail("PTY output chunk exceeds configured byte limit".into());
+                        break;
+                    }
+                    let count = (bytes.len() - offset).min(UPDATE_BYTES - processed);
+                    processed += count;
+                    let chunk_start = now();
                     if !matches!(self.state, SessionState::Failed(_) | SessionState::Closed)
-                        && let Err(error) = self.terminal.advance(&bytes, |response| {
-                            // Draining a dead peer's final output requires no protocol reply.
-                            if self.child_exited.load(Ordering::Acquire) {
-                                return Ok(());
-                            }
-                            let result = enqueue_input(&self.input, response);
-                            if self.child_exited.load(Ordering::Acquire) {
-                                return Ok(());
-                            }
-                            result.context("send terminal response")
-                        })
+                        && let Err(error) =
+                            self.terminal
+                                .advance(&bytes[offset..offset + count], |response| {
+                                    // Draining a dead peer's final output requires no protocol reply.
+                                    if self.child_exited.load(Ordering::Acquire) {
+                                        return Ok(());
+                                    }
+                                    let result = enqueue_input(&self.input, response, None);
+                                    if self.child_exited.load(Ordering::Acquire) {
+                                        return Ok(());
+                                    }
+                                    result.context("send terminal response")
+                                })
                     {
                         self.fail(format!("{error:#}"));
+                    }
+                    self.diagnostics.max_chunk_duration = self
+                        .diagnostics
+                        .max_chunk_duration
+                        .max(now().duration_since(chunk_start));
+                    if offset + count < bytes.len() {
+                        self.pending_bytes = Some((bytes, offset + count));
                     }
                 }
                 Ok(Output::Resized(size)) => {
@@ -232,7 +288,18 @@ impl Session {
         {
             self.state = SessionState::Draining;
         }
-        if processed >= UPDATE_BYTES || start.elapsed() >= UPDATE_TIME {
+        let duration = now().duration_since(start);
+        self.diagnostics.polls = self.diagnostics.polls.saturating_add(1);
+        self.diagnostics.processed_bytes = self
+            .diagnostics
+            .processed_bytes
+            .saturating_add(processed as u64);
+        self.diagnostics.last_update_bytes = processed;
+        self.diagnostics.max_update_bytes = self.diagnostics.max_update_bytes.max(processed);
+        self.diagnostics.last_poll_duration = duration;
+        self.diagnostics.max_poll_duration = self.diagnostics.max_poll_duration.max(duration);
+        if budget_exhausted {
+            self.diagnostics.budget_followups = self.diagnostics.budget_followups.saturating_add(1);
             (self.wakeup)();
         }
     }
@@ -276,13 +343,20 @@ impl Drop for Session {
     }
 }
 
-fn enqueue_input(input: &SyncSender<Vec<u8>>, bytes: &[u8]) -> Result<()> {
+fn enqueue_input(
+    input: &SyncSender<transport::Input>,
+    bytes: &[u8],
+    accepted_at: Option<Instant>,
+) -> Result<()> {
     ensure!(!bytes.is_empty(), "cannot send empty terminal input");
     ensure!(
         bytes.len() <= MAX_INPUT_BYTES,
         "terminal input exceeds {MAX_INPUT_BYTES} bytes"
     );
-    match input.try_send(bytes.to_vec()) {
+    match input.try_send(transport::Input {
+        bytes: bytes.to_vec(),
+        accepted_at,
+    }) {
         Ok(()) => Ok(()),
         Err(TrySendError::Full(_)) => bail!("terminal input queue is full; input was not accepted"),
         Err(TrySendError::Disconnected(_)) => bail!("terminal input worker disconnected"),
@@ -293,7 +367,7 @@ fn enqueue_input(input: &SyncSender<Vec<u8>>, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn test_session() -> (Session, Receiver<Vec<u8>>, SyncSender<Output>) {
+    fn test_session() -> (Session, Receiver<transport::Input>, SyncSender<Output>) {
         let (input, input_rx) = mpsc::sync_channel(QUEUE_CHUNKS);
         let (resize, _resize_rx) = mpsc::sync_channel(1);
         let (output_tx, output) = mpsc::sync_channel(QUEUE_CHUNKS);
@@ -307,10 +381,14 @@ mod tests {
                 resize,
                 resizing: false,
                 output,
+                pending_bytes: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 child_exited: Arc::new(AtomicBool::new(false)),
                 worker: None,
                 wakeup: Arc::new(|| {}),
+                started_at: Instant::now(),
+                diagnostics: SessionDiagnostics::default(),
+                worker_diagnostics: Arc::new(WorkerDiagnostics::default()),
             },
             input_rx,
             output_tx,
@@ -410,23 +488,209 @@ mod tests {
     #[test]
     fn input_limits_and_queue_pressure_are_explicit_errors() {
         let (input, output) = mpsc::sync_channel(1);
-        assert!(enqueue_input(&input, &[]).is_err());
-        assert!(enqueue_input(&input, &vec![0; MAX_INPUT_BYTES + 1]).is_err());
-        enqueue_input(&input, b"first").unwrap();
+        assert!(enqueue_input(&input, &[], None).is_err());
+        assert!(enqueue_input(&input, &vec![0; MAX_INPUT_BYTES + 1], None).is_err());
+        enqueue_input(&input, b"first", None).unwrap();
         assert!(
-            enqueue_input(&input, b"second")
+            enqueue_input(&input, b"second", None)
                 .unwrap_err()
                 .to_string()
                 .contains("full")
         );
-        assert_eq!(output.recv().unwrap(), b"first");
+        assert_eq!(output.recv().unwrap().bytes, b"first");
         drop(output);
         assert!(
-            enqueue_input(&input, b"third")
+            enqueue_input(&input, b"third", None)
                 .unwrap_err()
                 .to_string()
                 .contains("disconnected")
         );
+    }
+
+    #[test]
+    fn full_output_queue_resumes_losslessly_with_a_hard_update_byte_cap() {
+        let (mut session, _input, output) = test_session();
+        assert_eq!(UPDATE_BYTES % transport::CHUNK_BYTES, 0);
+        for index in 0..QUEUE_CHUNKS {
+            output
+                .try_send(Output::Bytes(vec![
+                    b'a' + index as u8;
+                    transport::CHUNK_BYTES
+                ]))
+                .unwrap();
+        }
+        assert!(matches!(
+            output.try_send(Output::Bytes(vec![b'z'; transport::CHUNK_BYTES])),
+            Err(TrySendError::Full(_))
+        ));
+        let clock = Instant::now();
+        session.poll_with_clock(|| clock);
+        let stats = session.diagnostics();
+        assert_eq!(stats.last_update_bytes, UPDATE_BYTES);
+        assert_eq!(stats.budget_followups, 1);
+        // The second half must still be in the real bounded output channel, in order.
+        for index in UPDATE_BYTES / transport::CHUNK_BYTES..QUEUE_CHUNKS {
+            match session.output.try_recv().unwrap() {
+                Output::Bytes(bytes) => {
+                    assert_eq!(bytes, vec![b'a' + index as u8; transport::CHUNK_BYTES])
+                }
+                _ => panic!("unexpected control message"),
+            }
+        }
+        assert!(matches!(
+            session.output.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+        assert!(!matches!(session.state(), SessionState::Failed(_)));
+    }
+
+    #[test]
+    fn soft_time_budget_preserves_remaining_chunks_and_records_overrun() {
+        let (mut session, _input, output) = test_session();
+        output.send(Output::Bytes(b"first".to_vec())).unwrap();
+        output.send(Output::Bytes(b"second".to_vec())).unwrap();
+        let start = Instant::now();
+        let mut calls = 0;
+        session.poll_with_clock(|| {
+            calls += 1;
+            // Start, budget check, chunk start, then an expensive chunk completes.
+            if calls <= 3 {
+                start
+            } else {
+                start + UPDATE_TIME + Duration::from_millis(1)
+            }
+        });
+        let stats = session.diagnostics();
+        assert_eq!(stats.last_update_bytes, 5);
+        assert_eq!(
+            stats.max_chunk_duration,
+            UPDATE_TIME + Duration::from_millis(1)
+        );
+        assert_eq!(stats.budget_followups, 1);
+        session.poll_with_clock(|| start);
+        assert_eq!(session.diagnostics().last_update_bytes, 6);
+        assert_eq!(session.diagnostics().processed_bytes, 11);
+    }
+
+    #[test]
+    fn uneven_chunks_cannot_exceed_the_byte_cap_or_reorder_resize() {
+        let (mut session, _input, output) = test_session();
+        output.send(Output::Bytes(b"x".to_vec())).unwrap();
+        for _ in 0..UPDATE_BYTES / transport::CHUNK_BYTES {
+            output
+                .send(Output::Bytes(vec![b'y'; transport::CHUNK_BYTES]))
+                .unwrap();
+        }
+        let size = TerminalSize {
+            grid: GridSize::new(90, 30).unwrap(),
+            ..Default::default()
+        };
+        output.send(Output::Resized(size)).unwrap();
+        let now = Instant::now();
+        session.poll_with_clock(|| now);
+        assert_eq!(session.diagnostics().last_update_bytes, UPDATE_BYTES);
+        assert_eq!(
+            session.pending_bytes.as_ref().unwrap().1,
+            transport::CHUNK_BYTES - 1
+        );
+        assert_eq!(session.size(), GridSize::default());
+        session.poll_with_clock(|| now);
+        assert_eq!(session.diagnostics().last_update_bytes, 1);
+        assert!(session.pending_bytes.is_none());
+        assert_eq!(session.size(), size.grid);
+        assert_eq!(
+            session.diagnostics().processed_bytes,
+            UPDATE_BYTES as u64 + 1
+        );
+    }
+
+    #[test]
+    fn split_budget_boundary_preserves_utf8_and_query_time_dimensions() {
+        let (mut session, input, output) = test_session();
+        output.send(Output::Bytes(vec![0])).unwrap();
+        for _ in 0..UPDATE_BYTES / transport::CHUNK_BYTES - 1 {
+            output
+                .send(Output::Bytes(vec![0; transport::CHUNK_BYTES]))
+                .unwrap();
+        }
+        let mut final_chunk = vec![0; transport::CHUNK_BYTES];
+        final_chunk[transport::CHUNK_BYTES - 2..].copy_from_slice(b"\xc3\xa9");
+        output.send(Output::Bytes(final_chunk)).unwrap();
+        output.send(Output::Bytes(b"\x1b[18t".to_vec())).unwrap();
+        let resized = TerminalSize {
+            grid: GridSize::new(90, 30).unwrap(),
+            ..Default::default()
+        };
+        output.send(Output::Resized(resized)).unwrap();
+        let clock = Instant::now();
+        session.poll_with_clock(|| clock);
+        assert_eq!(session.diagnostics().last_update_bytes, UPDATE_BYTES);
+        session.poll_with_clock(|| clock);
+        assert_eq!(
+            session.terminal().grid()[alacritty_terminal::index::Point::new(
+                alacritty_terminal::index::Line(0),
+                alacritty_terminal::index::Column(0)
+            )]
+            .c,
+            '\u{e9}'
+        );
+        let reply = input.try_recv().unwrap();
+        assert_eq!(reply.bytes, b"\x1b[8;24;80t");
+        assert!(reply.accepted_at.is_none());
+        assert_eq!(session.size(), resized.grid);
+    }
+
+    #[test]
+    fn idle_polling_and_sampling_do_not_request_repaint() {
+        use std::sync::atomic::AtomicUsize;
+        let (mut session, _input, _output) = test_session();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let count = wakes.clone();
+        session.wakeup = Arc::new(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+        });
+        let clock = Instant::now();
+        for _ in 0..100 {
+            session.poll_with_clock(|| clock);
+            let stats = session.diagnostics();
+            assert_eq!(stats.budget_followups, 0);
+            assert_eq!(stats.processed_bytes, 0);
+        }
+        assert_eq!(wakes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn configured_input_queue_accepts_exactly_32_maximum_chunks() {
+        let (session, receiver, _output) = test_session();
+        for _ in 0..QUEUE_CHUNKS {
+            session.send_input(&vec![b'x'; MAX_INPUT_BYTES]).unwrap();
+        }
+        assert!(
+            session
+                .send_input(b"overflow")
+                .unwrap_err()
+                .to_string()
+                .contains("full")
+        );
+        for _ in 0..QUEUE_CHUNKS {
+            let input = receiver.try_recv().unwrap();
+            assert_eq!(input.bytes.len(), MAX_INPUT_BYTES);
+            assert!(input.accepted_at.is_some());
+        }
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn oversized_output_is_a_visible_failure_not_a_budget_overrun() {
+        let (mut session, _input, output) = test_session();
+        output
+            .send(Output::Bytes(vec![0; transport::CHUNK_BYTES + 1]))
+            .unwrap();
+        session.poll();
+        assert!(
+            matches!(session.state(), SessionState::Failed(message) if message.contains("chunk"))
+        );
+        assert_eq!(session.diagnostics().processed_bytes, 0);
     }
 
     #[test]

@@ -3,15 +3,36 @@ use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 
+use super::diagnostics::{WorkerDiagnostics, increment, nanoseconds};
 use super::{GridSize, MAX_INPUT_BYTES, TerminalSize, Wakeup};
 
 pub(super) const CHUNK_BYTES: usize = 4_096;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+pub(super) struct Input {
+    pub bytes: Vec<u8>,
+    pub accepted_at: Option<Instant>,
+}
+
+pub(super) struct WorkerContext<'a> {
+    pub cancelled: &'a AtomicBool,
+    pub child_exited: &'a AtomicBool,
+    pub wakeup: &'a Wakeup,
+    pub diagnostics: &'a WorkerDiagnostics,
+    pub started_at: Instant,
+}
+
+impl WorkerContext<'_> {
+    fn wake(&self) {
+        increment(&self.diagnostics.wakeups);
+        (self.wakeup)();
+    }
+}
 
 pub(super) enum Output {
     Started(u32),
@@ -23,24 +44,15 @@ pub(super) enum Output {
 pub(super) fn run(
     command: CommandBuilder,
     size: GridSize,
-    commands: (Receiver<Vec<u8>>, Receiver<TerminalSize>),
+    commands: (Receiver<Input>, Receiver<TerminalSize>),
     output: &SyncSender<Output>,
-    cancelled: &AtomicBool,
-    child_exited: &AtomicBool,
-    wakeup: &Wakeup,
+    context: &WorkerContext<'_>,
 ) -> Result<ExitStatus> {
     let mut process = PtyProcess::spawn(command, size)?;
-    let result = process.transfer(
-        commands.0,
-        commands.1,
-        output,
-        cancelled,
-        child_exited,
-        wakeup,
-    );
+    let result = process.transfer(commands.0, commands.1, output, context);
     let cleanup = process.stop();
     if cleanup.is_ok() {
-        child_exited.store(true, Ordering::Release);
+        context.child_exited.store(true, Ordering::Release);
     }
     match (result, cleanup) {
         (Err(error), Err(cleanup)) => {
@@ -92,12 +104,10 @@ impl PtyProcess {
 
     fn transfer(
         &mut self,
-        input: Receiver<Vec<u8>>,
+        input: Receiver<Input>,
         resize: Receiver<TerminalSize>,
         output: &SyncSender<Output>,
-        cancelled: &AtomicBool,
-        child_exited: &AtomicBool,
-        wakeup: &Wakeup,
+        context: &WorkerContext<'_>,
     ) -> Result<()> {
         let pid = self
             .child
@@ -113,19 +123,22 @@ impl PtyProcess {
         let mut finishing = false;
 
         loop {
-            if cancelled.load(Ordering::Acquire) {
+            if context.cancelled.load(Ordering::Acquire) {
                 return Ok(());
             }
 
             if let Some(event) = pending_output.take() {
                 match output.try_send(event) {
                     Ok(()) => {
-                        wakeup();
+                        context.wake();
                         if finishing {
                             return Ok(());
                         }
                     }
-                    Err(TrySendError::Full(event)) => pending_output = Some(event),
+                    Err(TrySendError::Full(event)) => {
+                        increment(&context.diagnostics.backpressure_retries);
+                        pending_output = Some(event);
+                    }
                     Err(TrySendError::Disconnected(_)) => {
                         bail!("session output receiver disconnected")
                     }
@@ -135,7 +148,7 @@ impl PtyProcess {
             if self.exit_status.is_none() {
                 self.exit_status = self.child.try_wait().context("check session child exit")?;
                 if self.exit_status.is_some() {
-                    child_exited.store(true, Ordering::Release);
+                    context.child_exited.store(true, Ordering::Release);
                 }
             }
 
@@ -154,7 +167,7 @@ impl PtyProcess {
             if self.exit_status.is_none() {
                 if pending_input.is_none() {
                     match input.try_recv() {
-                        Ok(bytes) => pending_input = Some(PendingWrite::new(bytes)),
+                        Ok(input) => pending_input = Some(PendingWrite::new(input)),
                         Err(TryRecvError::Empty) => {}
                         Err(TryRecvError::Disconnected) => {
                             bail!("session input sender disconnected")
@@ -164,6 +177,23 @@ impl PtyProcess {
                 if let Some(write) = pending_input.as_mut()
                     && write.advance(&mut self.writer).context("write PTY input")?
                 {
+                    if let Some(accepted_at) = write.accepted_at {
+                        let delivered_at = Instant::now();
+                        let latency = nanoseconds(delivered_at.duration_since(accepted_at));
+                        context
+                            .diagnostics
+                            .last_input_latency_ns
+                            .store(latency, Ordering::Relaxed);
+                        context
+                            .diagnostics
+                            .max_input_latency_ns
+                            .fetch_max(latency, Ordering::Relaxed);
+                        context.diagnostics.last_input_delivered_at_ns.store(
+                            nanoseconds(delivered_at.duration_since(context.started_at)),
+                            Ordering::Relaxed,
+                        );
+                        increment(&context.diagnostics.delivered_inputs);
+                    }
                     pending_input = None;
                 }
             }
@@ -276,12 +306,17 @@ fn wait_ready(fd: RawFd, read: bool, write: bool) -> Result<()> {
 struct PendingWrite {
     bytes: Vec<u8>,
     offset: usize,
+    accepted_at: Option<Instant>,
 }
 
 impl PendingWrite {
-    fn new(bytes: Vec<u8>) -> Self {
-        debug_assert!(bytes.len() <= MAX_INPUT_BYTES);
-        Self { bytes, offset: 0 }
+    fn new(input: Input) -> Self {
+        debug_assert!(input.bytes.len() <= MAX_INPUT_BYTES);
+        Self {
+            bytes: input.bytes,
+            offset: 0,
+            accepted_at: input.accepted_at,
+        }
     }
 
     fn advance(&mut self, writer: &mut impl Write) -> io::Result<bool> {
@@ -326,7 +361,10 @@ mod tests {
             calls: 0,
             bytes: Vec::new(),
         };
-        let mut pending = PendingWrite::new(b"abc".to_vec());
+        let mut pending = PendingWrite::new(Input {
+            bytes: b"abc".to_vec(),
+            accepted_at: None,
+        });
         assert!(!pending.advance(&mut writer).unwrap());
         assert!(!pending.advance(&mut writer).unwrap());
         assert!(!pending.advance(&mut writer).unwrap());
@@ -336,7 +374,10 @@ mod tests {
 
     #[test]
     fn write_failure_is_returned_to_the_worker() {
-        let mut pending = PendingWrite::new(b"input".to_vec());
+        let mut pending = PendingWrite::new(Input {
+            bytes: b"input".to_vec(),
+            accepted_at: None,
+        });
         let error = pending
             .advance(&mut io::Cursor::new(&mut [0u8; 0][..]))
             .unwrap_err();

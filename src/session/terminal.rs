@@ -274,6 +274,28 @@ mod tests {
     }
 
     #[test]
+    fn scrollback_stays_bounded_across_output_resize_and_alternate_screen() {
+        let mut terminal = TerminalState::new(GridSize::default());
+        for _ in 0..SCROLLBACK_LINES * 3 {
+            terminal.advance(b"line\r\n", |_| Ok(())).unwrap();
+        }
+        assert_eq!(terminal.core.grid().history_size(), SCROLLBACK_LINES);
+        terminal.core.resize(GridSize::new(40, 10).unwrap());
+        assert!(terminal.core.grid().history_size() <= SCROLLBACK_LINES);
+        terminal.advance(b"\x1b[?1049h", |_| Ok(())).unwrap();
+        for _ in 0..SCROLLBACK_LINES * 2 {
+            terminal.advance(b"alternate\r\n", |_| Ok(())).unwrap();
+        }
+        assert_eq!(terminal.core.grid().history_size(), 0);
+        terminal.advance(b"\x1b[?1049l", |_| Ok(())).unwrap();
+        assert!(terminal.core.grid().history_size() <= SCROLLBACK_LINES);
+        for _ in 0..SCROLLBACK_LINES * 2 {
+            terminal.advance(b"restored\r\n", |_| Ok(())).unwrap();
+        }
+        assert_eq!(terminal.core.grid().history_size(), SCROLLBACK_LINES);
+    }
+
+    #[test]
     fn palette_covers_cube_and_grayscale_boundaries() {
         assert_eq!(default_color(16), Some(Rgb { r: 0, g: 0, b: 0 }));
         assert_eq!(

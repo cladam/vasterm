@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
 use portable_pty::CommandBuilder;
@@ -72,6 +73,11 @@ fn emulator_protocol_responses_are_received_by_the_child() {
     });
     assert!(screen(&session).contains("QUERIES_OK"));
     assert!(matches!(session.state(), SessionState::Exited(status) if status.success()));
+    assert_eq!(
+        session.diagnostics().delivered_inputs,
+        0,
+        "protocol replies are not user inputs"
+    );
 }
 
 #[test]
@@ -238,6 +244,71 @@ fn output_backpressure_does_not_prevent_input_delivery() {
         matches!(s.state(), SessionState::Exited(_))
     });
     assert!(matches!(session.state(), SessionState::Exited(status) if status.exit_code() == 12));
+    let stats = session.diagnostics();
+    assert!(stats.output_backpressure_retries > 0);
+    assert_eq!(stats.delivered_inputs, 1);
+    assert!(stats.max_input_latency < Duration::from_secs(1));
+    assert!(stats.last_input_delivered_at <= stats.elapsed);
+}
+
+#[test]
+fn saturated_output_preserves_retained_lines_and_update_bounds() {
+    let mut session = fixture("numbered-output");
+    wait_for(&mut session, |s| {
+        matches!(s.state(), SessionState::Running { .. })
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    // Do not drain the output queue until the worker proves it is backpressured.
+    while session.diagnostics().output_backpressure_retries == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "worker did not reach output backpressure"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    wait_for(&mut session, |s| {
+        matches!(s.state(), SessionState::Exited(_))
+    });
+    assert!(matches!(session.state(), SessionState::Exited(status) if status.success()));
+    let stats = session.diagnostics();
+    assert!(stats.max_update_bytes <= vasterm::session::UPDATE_BYTES);
+    assert!(stats.processed_bytes >= 30_000 * 8);
+    let grid = session.terminal().grid();
+    assert_eq!(grid.history_size(), vasterm::session::SCROLLBACK_LINES);
+    let retained_count = grid.total_lines() - 1; // The last row contains the final marker.
+    for (offset, number) in (30_000 - retained_count + 1..=30_000).enumerate() {
+        let row = Line(offset as i32 - grid.history_size() as i32);
+        let text: String = (0..6)
+            .map(|column| grid[Point::new(row, Column(column))].c)
+            .collect();
+        assert_eq!(text, format!("{number:06}"), "retained row {offset}");
+    }
+    assert!(screen(&session).contains("NUMBERED_DONE"));
+    eprintln!(
+        "numbered-output: {} bytes, max update {} bytes, max poll {:.3} ms, max chunk {:.3} ms, {} backpressure retries",
+        stats.processed_bytes,
+        stats.max_update_bytes,
+        stats.max_poll_duration.as_secs_f64() * 1_000.0,
+        stats.max_chunk_duration.as_secs_f64() * 1_000.0,
+        stats.output_backpressure_retries,
+    );
+}
+
+#[test]
+fn idle_worker_and_diagnostic_reads_do_not_schedule_ui_work() {
+    let mut session = fixture("idle");
+    wait_for(&mut session, |s| screen(s).contains("READY"));
+    // Allow the final output publication to finish before comparing wake counters.
+    thread::sleep(Duration::from_millis(50));
+    session.poll();
+    let before = session.diagnostics();
+    thread::sleep(Duration::from_millis(150));
+    for _ in 0..100 {
+        let stats = session.diagnostics();
+        assert_eq!(stats.worker_wakeups, before.worker_wakeups);
+        assert_eq!(stats.budget_followups, before.budget_followups);
+    }
+    session.shutdown().unwrap();
 }
 
 #[test]
@@ -364,6 +435,12 @@ fn pty_child_fixture() {
             stdout.write_all(b"\r\nFINAL_OUTPUT").unwrap();
             stdout.flush().unwrap();
             std::process::exit(9);
+        }
+        "numbered-output" => {
+            for number in 1..=30_000 {
+                write!(stdout, "{number:06}\r\n").unwrap();
+            }
+            stdout.write_all(b"NUMBERED_DONE").unwrap();
         }
         "late-query" => {
             stdout.write_all(b"\x1b[6n").unwrap();

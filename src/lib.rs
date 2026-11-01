@@ -3,16 +3,29 @@ pub mod session;
 mod surface;
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use session::{GridSize, Session, SessionState, local_shell_command};
+use session::{
+    GridSize, MAX_INPUT_BYTES, QUEUE_CHUNKS, SCROLLBACK_LINES, Session, SessionState, UPDATE_BYTES,
+    UPDATE_TIME, local_shell_command,
+};
 
 pub struct VastermApp {
     session: Option<Session>,
     startup_error: Option<String>,
     surface: surface::TerminalSurface,
     interaction_error: Option<String>,
+    diagnostics: UiDiagnostics,
+}
+
+#[derive(Default)]
+struct UiDiagnostics {
+    logic_passes: u64,
+    ui_passes: u64,
+    max_logic_duration: Duration,
+    max_ui_duration: Duration,
 }
 
 impl VastermApp {
@@ -31,12 +44,14 @@ impl VastermApp {
                 startup_error: None,
                 surface: Default::default(),
                 interaction_error: None,
+                diagnostics: UiDiagnostics::default(),
             },
             Err(error) => Self {
                 session: None,
                 startup_error: Some(format!("{error:#}")),
                 surface: Default::default(),
                 interaction_error: None,
+                diagnostics: UiDiagnostics::default(),
             },
         }
     }
@@ -76,6 +91,41 @@ impl VastermApp {
                     self.interaction_error = None;
                 }
             }
+            if let Some(session) = &self.session {
+                    ui.collapsing("Load diagnostics", |ui| {
+                        let stats = session.diagnostics();
+                        ui.label(format!(
+                            "Logic passes: {} | UI passes: {} | Worker wakes: {} | Budget follow-ups: {}",
+                            self.diagnostics.logic_passes, self.diagnostics.ui_passes,
+                            stats.worker_wakeups, stats.budget_followups,
+                        ));
+                        ui.label(format!(
+                            "Processed: {} bytes | Last/max update: {}/{} bytes | Backpressure retries: {}",
+                            stats.processed_bytes, stats.last_update_bytes, stats.max_update_bytes,
+                            stats.output_backpressure_retries,
+                        ));
+                        ui.label(format!(
+                            "Max poll/chunk: {:.3}/{:.3} ms | Max logic/UI: {:.3}/{:.3} ms",
+                            stats.max_poll_duration.as_secs_f64() * 1_000.0,
+                            stats.max_chunk_duration.as_secs_f64() * 1_000.0,
+                            self.diagnostics.max_logic_duration.as_secs_f64() * 1_000.0,
+                            self.diagnostics.max_ui_duration.as_secs_f64() * 1_000.0,
+                        ));
+                        ui.label(format!(
+                            "Delivered user inputs: {} | Last/max delivery latency: {:.3}/{:.3} ms | Last delivery: {:.3} s after session start",
+                            stats.delivered_inputs,
+                            stats.last_input_latency.as_secs_f64() * 1_000.0,
+                            stats.max_input_latency.as_secs_f64() * 1_000.0,
+                            stats.last_input_delivered_at.as_secs_f64(),
+                        ));
+                        ui.label(format!(
+                            "Input queue: {} x {} bytes | History: {} lines | Update: {} bytes / soft {} ms",
+                            QUEUE_CHUNKS, MAX_INPUT_BYTES, SCROLLBACK_LINES,
+                            UPDATE_BYTES, UPDATE_TIME.as_millis(),
+                        ));
+                        ui.label("Passive counters; no repaint timer. PTY delivery is not proof of child receipt.");
+                    });
+            }
             ui.separator();
             if let Some(session) = self.session.as_mut()
                 && let Err(error) = self.surface.show(ui, session)
@@ -89,13 +139,20 @@ impl VastermApp {
 
 impl eframe::App for VastermApp {
     fn logic(&mut self, _context: &egui::Context, _frame: &mut eframe::Frame) {
+        let start = Instant::now();
+        self.diagnostics.logic_passes = self.diagnostics.logic_passes.saturating_add(1);
         if let Some(session) = self.session.as_mut() {
             session.poll();
         }
+        self.diagnostics.max_logic_duration =
+            self.diagnostics.max_logic_duration.max(start.elapsed());
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let start = Instant::now();
+        self.diagnostics.ui_passes = self.diagnostics.ui_passes.saturating_add(1);
         self.show(ui);
+        self.diagnostics.max_ui_duration = self.diagnostics.max_ui_duration.max(start.elapsed());
     }
 
     fn on_exit(&mut self) {
@@ -111,7 +168,6 @@ impl eframe::App for VastermApp {
 mod tests {
     use super::*;
     use std::thread;
-    use std::time::{Duration, Instant};
 
     fn wait_for(session: &mut Session, ready: impl Fn(&Session) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -236,6 +292,34 @@ mod tests {
     }
 
     #[test]
+    fn load_diagnostics_are_available_without_an_interaction_error() {
+        let context = egui::Context::default();
+        let mut session = Session::spawn(
+            portable_pty::CommandBuilder::new("/bin/cat"),
+            GridSize::default(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        wait_for(&mut session, |session| {
+            matches!(session.state(), SessionState::Running { .. })
+        });
+        let mut app = VastermApp {
+            session: Some(session),
+            startup_error: None,
+            surface: Default::default(),
+            interaction_error: None,
+            diagnostics: UiDiagnostics::default(),
+        };
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.show(ui));
+        output.textures_delta.clear();
+        assert!(output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::epaint::Shape::Text(text)
+                if text.galley.text() == "Load diagnostics")
+        }));
+        app.session.as_mut().unwrap().shutdown().unwrap();
+    }
+
+    #[test]
     fn startup_failure_is_visible_in_the_ui() {
         let context = egui::Context::default();
         let mut app = VastermApp {
@@ -243,6 +327,7 @@ mod tests {
             startup_error: Some("test shell could not start".into()),
             surface: Default::default(),
             interaction_error: None,
+            diagnostics: UiDiagnostics::default(),
         };
         let mut output = context.run_ui(egui::RawInput::default(), |ui| app.show(ui));
         // This headless test inspects paint output without uploading textures.
