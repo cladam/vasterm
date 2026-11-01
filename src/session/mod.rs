@@ -23,6 +23,8 @@ pub const MAX_INPUT_BYTES: usize = 4_096;
 pub const QUEUE_CHUNKS: usize = 32;
 pub const UPDATE_BYTES: usize = 64 * 1_024;
 pub const UPDATE_TIME: Duration = Duration::from_millis(4);
+/// Maximum bytes parsed before checking the soft update deadline again.
+pub const PARSE_BYTES: usize = 256;
 /// Schedule UI work promptly; the callback also runs on the PTY worker.
 pub type Wakeup = Arc<dyn Fn() + Send + Sync>;
 
@@ -77,6 +79,7 @@ pub struct Session {
     resizing: bool,
     output: Receiver<Output>,
     pending_bytes: Option<(Vec<u8>, usize)>,
+    pending_output: Option<Output>,
     cancelled: Arc<AtomicBool>,
     child_exited: Arc<AtomicBool>,
     worker: Option<JoinHandle<Result<ExitStatus>>>,
@@ -133,6 +136,7 @@ impl Session {
             resizing: false,
             output,
             pending_bytes: None,
+            pending_output: None,
             cancelled,
             child_exited,
             worker: Some(worker),
@@ -195,7 +199,7 @@ impl Session {
         enqueue_input(&self.input, bytes, Some(Instant::now()))
     }
 
-    /// Updates UI-owned state with a soft time budget checked between output chunks.
+    /// Updates UI-owned state with a soft time budget checked between bounded parse slices.
     pub fn poll(&mut self) {
         self.poll_with_clock(Instant::now);
     }
@@ -213,7 +217,13 @@ impl Session {
             let (event, offset) = if let Some((bytes, offset)) = self.pending_bytes.take() {
                 (Ok(Output::Bytes(bytes)), offset)
             } else {
-                (self.output.try_recv(), 0)
+                (
+                    self.pending_output
+                        .take()
+                        .map(Ok)
+                        .unwrap_or_else(|| self.output.try_recv()),
+                    0,
+                )
             };
             match event {
                 Ok(Output::Started(pid)) => {
@@ -226,13 +236,16 @@ impl Session {
                         self.fail("PTY output chunk exceeds configured byte limit".into());
                         break;
                     }
-                    let count = (bytes.len() - offset).min(UPDATE_BYTES - processed);
-                    processed += count;
+                    let allowance = (bytes.len() - offset).min(UPDATE_BYTES - processed);
                     let chunk_start = now();
-                    if !matches!(self.state, SessionState::Failed(_) | SessionState::Closed)
-                        && let Err(error) =
-                            self.terminal
-                                .advance(&bytes[offset..offset + count], |response| {
+                    let mut boundary = chunk_start;
+                    let count =
+                        if matches!(self.state, SessionState::Failed(_) | SessionState::Closed) {
+                            allowance
+                        } else {
+                            match self.terminal.advance_with_budget(
+                                &bytes[offset..offset + allowance],
+                                |response| {
                                     // Draining a dead peer's final output requires no protocol reply.
                                     if self.child_exited.load(Ordering::Acquire) {
                                         return Ok(());
@@ -242,10 +255,27 @@ impl Session {
                                         return Ok(());
                                     }
                                     result.context("send terminal response")
-                                })
-                    {
-                        self.fail(format!("{error:#}"));
-                    }
+                                },
+                                |slice_bytes| {
+                                    let end = now();
+                                    self.diagnostics.max_parse_duration = self
+                                        .diagnostics
+                                        .max_parse_duration
+                                        .max(end.duration_since(boundary));
+                                    self.diagnostics.max_parse_bytes =
+                                        self.diagnostics.max_parse_bytes.max(slice_bytes);
+                                    boundary = end;
+                                    end.duration_since(start) < UPDATE_TIME
+                                },
+                            ) {
+                                Ok(count) => count,
+                                Err(error) => {
+                                    self.fail(format!("{error:#}"));
+                                    allowance
+                                }
+                            }
+                        };
+                    processed += count;
                     self.diagnostics.max_chunk_duration = self
                         .diagnostics
                         .max_chunk_duration
@@ -274,6 +304,14 @@ impl Session {
                 }
             }
         }
+        if budget_exhausted && self.pending_bytes.is_none() && self.pending_output.is_none() {
+            // A publication after this empty check has its own worker wakeup.
+            match self.output.try_recv() {
+                Ok(event) => self.pending_output = Some(event),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => disconnected = true,
+            }
+        }
         if (disconnected
             || self
                 .worker
@@ -298,7 +336,7 @@ impl Session {
         self.diagnostics.max_update_bytes = self.diagnostics.max_update_bytes.max(processed);
         self.diagnostics.last_poll_duration = duration;
         self.diagnostics.max_poll_duration = self.diagnostics.max_poll_duration.max(duration);
-        if budget_exhausted {
+        if budget_exhausted && (self.pending_bytes.is_some() || self.pending_output.is_some()) {
             self.diagnostics.budget_followups = self.diagnostics.budget_followups.saturating_add(1);
             (self.wakeup)();
         }
@@ -382,6 +420,7 @@ mod tests {
                 resizing: false,
                 output,
                 pending_bytes: None,
+                pending_output: None,
                 cancelled: Arc::new(AtomicBool::new(false)),
                 child_exited: Arc::new(AtomicBool::new(false)),
                 worker: None,
@@ -530,7 +569,11 @@ mod tests {
         assert_eq!(stats.budget_followups, 1);
         // The second half must still be in the real bounded output channel, in order.
         for index in UPDATE_BYTES / transport::CHUNK_BYTES..QUEUE_CHUNKS {
-            match session.output.try_recv().unwrap() {
+            match session
+                .pending_output
+                .take()
+                .unwrap_or_else(|| session.output.try_recv().unwrap())
+            {
                 Output::Bytes(bytes) => {
                     assert_eq!(bytes, vec![b'a' + index as u8; transport::CHUNK_BYTES])
                 }
@@ -657,6 +700,101 @@ mod tests {
             assert_eq!(stats.processed_bytes, 0);
         }
         assert_eq!(wakes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn time_budget_stops_inside_a_chunk_without_reading_later_resize() {
+        let (mut session, _input, output) = test_session();
+        output
+            .send(Output::Bytes(vec![b'x'; transport::CHUNK_BYTES]))
+            .unwrap();
+        let resized = TerminalSize {
+            grid: GridSize::new(90, 30).unwrap(),
+            ..Default::default()
+        };
+        output.send(Output::Resized(resized)).unwrap();
+        let start = Instant::now();
+        let mut calls = 0;
+        session.poll_with_clock(|| {
+            calls += 1;
+            if calls <= 3 {
+                start
+            } else {
+                start + UPDATE_TIME
+            }
+        });
+        assert_eq!(session.diagnostics().last_update_bytes, PARSE_BYTES);
+        assert_eq!(session.diagnostics().max_parse_bytes, PARSE_BYTES);
+        assert_eq!(session.pending_bytes.as_ref().unwrap().1, PARSE_BYTES);
+        assert_eq!(session.size(), GridSize::default());
+        session.poll_with_clock(|| start);
+        assert_eq!(
+            session.diagnostics().processed_bytes,
+            transport::CHUNK_BYTES as u64
+        );
+        assert_eq!(session.size(), resized.grid);
+    }
+
+    #[test]
+    fn exhausted_budget_with_no_backlog_does_not_schedule_an_empty_pass() {
+        let (mut session, _input, output) = test_session();
+        for _ in 0..UPDATE_BYTES / transport::CHUNK_BYTES {
+            output
+                .send(Output::Bytes(vec![0; transport::CHUNK_BYTES]))
+                .unwrap();
+        }
+        let clock = Instant::now();
+        session.poll_with_clock(|| clock);
+        assert_eq!(session.diagnostics().last_update_bytes, UPDATE_BYTES);
+        assert_eq!(session.diagnostics().budget_followups, 0);
+        assert!(session.pending_output.is_none());
+        let mut calls = 0;
+        session.poll_with_clock(|| {
+            calls += 1;
+            if calls == 1 {
+                clock
+            } else {
+                clock + UPDATE_TIME
+            }
+        });
+        assert_eq!(session.diagnostics().last_update_bytes, 0);
+        assert_eq!(session.diagnostics().budget_followups, 0);
+    }
+
+    #[test]
+    fn publication_on_either_side_of_backlog_probe_is_not_lost() {
+        use std::sync::atomic::AtomicUsize;
+        for publish_on_call in [2, 3] {
+            let (mut session, _input, output) = test_session();
+            let wakes = Arc::new(AtomicUsize::new(0));
+            let worker_wakes = wakes.clone();
+            let ui_wakes = wakes.clone();
+            session.wakeup = Arc::new(move || {
+                ui_wakes.fetch_add(1, Ordering::Relaxed);
+            });
+            let start = Instant::now();
+            let mut calls = 0;
+            session.poll_with_clock(|| {
+                calls += 1;
+                if calls == publish_on_call {
+                    output.send(Output::Bytes(b"late".to_vec())).unwrap();
+                    // Match the transport's publication-before-wakeup ordering.
+                    worker_wakes.fetch_add(1, Ordering::Relaxed);
+                }
+                if calls == 1 {
+                    start
+                } else {
+                    start + UPDATE_TIME
+                }
+            });
+            assert!(wakes.load(Ordering::Relaxed) > 0);
+            assert_eq!(
+                session.diagnostics().budget_followups,
+                u64::from(publish_on_call == 2)
+            );
+            session.poll_with_clock(|| start);
+            assert_eq!(session.diagnostics().processed_bytes, 4);
+        }
     }
 
     #[test]

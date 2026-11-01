@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 
 use session::{
-    GridSize, MAX_INPUT_BYTES, QUEUE_CHUNKS, SCROLLBACK_LINES, Session, SessionState, UPDATE_BYTES,
-    UPDATE_TIME, local_shell_command,
+    GridSize, MAX_INPUT_BYTES, PARSE_BYTES, QUEUE_CHUNKS, SCROLLBACK_LINES, Session, SessionState,
+    UPDATE_BYTES, UPDATE_TIME, local_shell_command,
 };
 
 pub struct VastermApp {
@@ -105,9 +105,10 @@ impl VastermApp {
                             stats.output_backpressure_retries,
                         ));
                         ui.label(format!(
-                            "Max poll/chunk: {:.3}/{:.3} ms | Max logic/UI: {:.3}/{:.3} ms",
+                            "Max poll/chunk/parse slice: {:.3}/{:.3}/{:.3} ms | Max logic/UI: {:.3}/{:.3} ms",
                             stats.max_poll_duration.as_secs_f64() * 1_000.0,
                             stats.max_chunk_duration.as_secs_f64() * 1_000.0,
+                            stats.max_parse_duration.as_secs_f64() * 1_000.0,
                             self.diagnostics.max_logic_duration.as_secs_f64() * 1_000.0,
                             self.diagnostics.max_ui_duration.as_secs_f64() * 1_000.0,
                         ));
@@ -119,9 +120,9 @@ impl VastermApp {
                             stats.last_input_delivered_at.as_secs_f64(),
                         ));
                         ui.label(format!(
-                            "Input queue: {} x {} bytes | History: {} lines | Update: {} bytes / soft {} ms",
+                            "Input queue: {} x {} bytes | History: {} lines | Update: {} bytes / soft {} ms | Parse slice: {} bytes",
                             QUEUE_CHUNKS, MAX_INPUT_BYTES, SCROLLBACK_LINES,
-                            UPDATE_BYTES, UPDATE_TIME.as_millis(),
+                            UPDATE_BYTES, UPDATE_TIME.as_millis(), PARSE_BYTES,
                         ));
                         ui.label("Passive counters; no repaint timer. PTY delivery is not proof of child receipt.");
                     });

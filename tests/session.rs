@@ -1,6 +1,7 @@
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -11,10 +12,49 @@ use portable_pty::CommandBuilder;
 use vasterm::session::{GridSize, Session, SessionState, TerminalSize};
 
 fn fixture(scenario: &str) -> Session {
+    fixture_with_wakeup(scenario, GridSize::default(), Arc::new(|| {}))
+}
+
+fn fixture_with_wakeup(
+    scenario: &str,
+    size: GridSize,
+    wakeup: vasterm::session::Wakeup,
+) -> Session {
     let mut command = CommandBuilder::new(std::env::current_exe().unwrap());
     command.args(["--exact", "pty_child_fixture", "--nocapture"]);
     command.env("VASTERM_TEST_SCENARIO", scenario);
-    Session::spawn(command, GridSize::default(), Arc::new(|| {})).unwrap()
+    Session::spawn(command, size, wakeup).unwrap()
+}
+
+fn wait_on_wakeup(session: &mut Session, wakeups: &Receiver<()>, ready: impl Fn(&Session) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready(session) {
+        wakeups
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("no repaint requested for pending session work");
+        session.poll();
+        assert!(
+            !matches!(session.state(), SessionState::Failed(_)),
+            "{}",
+            session.state()
+        );
+    }
+}
+
+fn repaint_channel() -> (vasterm::session::Wakeup, Receiver<()>) {
+    let (wakeup, wakes) = mpsc::sync_channel(1);
+    (
+        Arc::new(move || {
+            match wakeup.try_send(()) {
+                // A full slot already schedules a pass, like egui's coalesced repaint requests.
+                Ok(()) | Err(mpsc::TrySendError::Full(())) => {}
+                Err(mpsc::TrySendError::Disconnected(())) => {
+                    panic!("test wake receiver disconnected")
+                }
+            }
+        }),
+        wakes,
+    )
 }
 
 fn wait_for(session: &mut Session, ready: impl Fn(&Session) -> bool) {
@@ -226,7 +266,7 @@ fn output_backpressure_does_not_prevent_input_delivery() {
     };
     thread::sleep(Duration::from_millis(150));
     session.send_input(b"x").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(1);
     loop {
         // Signal 0 only checks this test's exact child PID; do not drain UI output yet.
         let result = unsafe { libc::kill(pid as i32, 0) };
@@ -253,7 +293,16 @@ fn output_backpressure_does_not_prevent_input_delivery() {
 
 #[test]
 fn saturated_output_preserves_retained_lines_and_update_bounds() {
-    let mut session = fixture("numbered-output");
+    assert_saturated_output(GridSize::default());
+}
+
+#[test]
+fn saturated_output_on_a_larger_grid_preserves_lines_and_parse_bounds() {
+    assert_saturated_output(GridSize::new(240, 80).unwrap());
+}
+
+fn assert_saturated_output(size: GridSize) {
+    let mut session = fixture_with_wakeup("numbered-output", size, Arc::new(|| {}));
     wait_for(&mut session, |s| {
         matches!(s.state(), SessionState::Running { .. })
     });
@@ -272,6 +321,7 @@ fn saturated_output_preserves_retained_lines_and_update_bounds() {
     assert!(matches!(session.state(), SessionState::Exited(status) if status.success()));
     let stats = session.diagnostics();
     assert!(stats.max_update_bytes <= vasterm::session::UPDATE_BYTES);
+    assert!(stats.max_parse_bytes <= vasterm::session::PARSE_BYTES);
     assert!(stats.processed_bytes >= 30_000 * 8);
     let grid = session.terminal().grid();
     assert_eq!(grid.history_size(), vasterm::session::SCROLLBACK_LINES);
@@ -285,11 +335,15 @@ fn saturated_output_preserves_retained_lines_and_update_bounds() {
     }
     assert!(screen(&session).contains("NUMBERED_DONE"));
     eprintln!(
-        "numbered-output: {} bytes, max update {} bytes, max poll {:.3} ms, max chunk {:.3} ms, {} backpressure retries",
+        "numbered-output {}x{}: {} bytes, max update {} bytes, max poll {:.3} ms, max chunk {:.3} ms, max parse {:.3} ms ({} bytes), {} backpressure retries",
+        size.columns(),
+        size.rows(),
         stats.processed_bytes,
         stats.max_update_bytes,
         stats.max_poll_duration.as_secs_f64() * 1_000.0,
         stats.max_chunk_duration.as_secs_f64() * 1_000.0,
+        stats.max_parse_duration.as_secs_f64() * 1_000.0,
+        stats.max_parse_bytes,
         stats.output_backpressure_retries,
     );
 }
@@ -309,6 +363,47 @@ fn idle_worker_and_diagnostic_reads_do_not_schedule_ui_work() {
         assert_eq!(stats.budget_followups, before.budget_followups);
     }
     session.shutdown().unwrap();
+}
+
+#[test]
+fn output_resize_queries_and_exit_progress_only_on_requested_wakeups() {
+    let (wakeup, wakes) = repaint_channel();
+    let mut session = fixture_with_wakeup("resize", GridSize::default(), wakeup);
+    wait_on_wakeup(&mut session, &wakes, |s| screen(s).contains("READY"));
+    let size = TerminalSize {
+        grid: GridSize::new(100, 30).unwrap(),
+        cell_width: 8,
+        cell_height: 16,
+    };
+    session.resize(size).unwrap();
+    wait_on_wakeup(&mut session, &wakes, |s| s.size() == size.grid);
+    session.send_input(b"x").unwrap();
+    wait_on_wakeup(&mut session, &wakes, |s| {
+        matches!(s.state(), SessionState::Exited(_))
+    });
+    assert!(screen(&session).contains("RESIZE_OK"));
+    assert!(matches!(session.state(), SessionState::Exited(status) if status.success()));
+}
+
+#[test]
+fn saturated_output_budget_continues_without_a_polling_timer() {
+    let (wakeup, wakes) = repaint_channel();
+    let mut session = fixture_with_wakeup("numbered-output", GridSize::default(), wakeup);
+    // Keep the UI asleep until output backpressure proves a real queued backlog.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while session.diagnostics().output_backpressure_retries == 0 {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    wait_on_wakeup(&mut session, &wakes, |s| {
+        matches!(s.state(), SessionState::Exited(_))
+    });
+    let stats = session.diagnostics();
+    assert!(stats.budget_followups > 0);
+    assert!(stats.max_parse_bytes <= vasterm::session::PARSE_BYTES);
+    assert!(stats.max_update_bytes <= vasterm::session::UPDATE_BYTES);
+    assert!(screen(&session).contains("NUMBERED_DONE"));
+    assert!(matches!(session.state(), SessionState::Exited(status) if status.success()));
 }
 
 #[test]

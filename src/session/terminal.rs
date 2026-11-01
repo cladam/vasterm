@@ -8,7 +8,7 @@ use alacritty_terminal::term::{Config, Osc52};
 use alacritty_terminal::vte::ansi::{Processor, Rgb};
 use anyhow::{Result, ensure};
 
-use super::MAX_INPUT_BYTES;
+use super::{MAX_INPUT_BYTES, PARSE_BYTES};
 
 pub const SCROLLBACK_LINES: usize = 1_000;
 
@@ -125,48 +125,70 @@ impl TerminalState {
         }
     }
 
+    #[cfg(test)]
     pub fn advance(
         &mut self,
         bytes: &[u8],
-        mut respond: impl FnMut(&[u8]) -> Result<()>,
+        respond: impl FnMut(&[u8]) -> Result<()>,
     ) -> Result<()> {
+        self.advance_with_budget(bytes, respond, |_| true)
+            .map(|_| ())
+    }
+
+    /// Yields only at a parse-slice boundary, flushing captured replies before returning.
+    /// Slice boundaries do not split response batches into separate input messages.
+    pub fn advance_with_budget(
+        &mut self,
+        bytes: &[u8],
+        mut respond: impl FnMut(&[u8]) -> Result<()>,
+        mut continue_after_slice: impl FnMut(usize) -> bool,
+    ) -> Result<usize> {
         let mut replies = Vec::new();
-        for byte in bytes {
-            // Handle queries before subsequent bytes can change their referenced state.
-            self.parser.advance(&mut self.core, &[*byte]);
-            let events = std::mem::take(&mut *self.events.0.borrow_mut());
-            for event in events {
-                let response = match event {
-                    Event::PtyWrite(response) => response,
-                    Event::ColorRequest(index, format) => {
-                        let color = self.core.colors()[index]
-                            .or_else(|| default_color(index))
-                            .ok_or_else(|| anyhow::anyhow!("unsupported terminal color {index}"))?;
-                        format(color)
+        let mut processed = 0;
+        for slice in bytes.chunks(PARSE_BYTES) {
+            for byte in slice {
+                // Handle queries before subsequent bytes can change their referenced state.
+                self.parser.advance(&mut self.core, &[*byte]);
+                let events = std::mem::take(&mut *self.events.0.borrow_mut());
+                for event in events {
+                    let response = match event {
+                        Event::PtyWrite(response) => response,
+                        Event::ColorRequest(index, format) => {
+                            let color = self.core.colors()[index]
+                                .or_else(|| default_color(index))
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("unsupported terminal color {index}")
+                                })?;
+                            format(color)
+                        }
+                        Event::TextAreaSizeRequest(format) => format(WindowSize {
+                            num_lines: self.core.screen_lines() as u16,
+                            num_cols: self.core.columns() as u16,
+                            cell_width: self.size.cell_width,
+                            cell_height: self.size.cell_height,
+                        }),
+                        _ => unreachable!("only protocol response events are queued"),
+                    };
+                    ensure!(
+                        response.len() <= MAX_INPUT_BYTES,
+                        "terminal response exceeds input limit"
+                    );
+                    if replies.len() + response.len() > MAX_INPUT_BYTES {
+                        respond(&replies)?;
+                        replies.clear();
                     }
-                    Event::TextAreaSizeRequest(format) => format(WindowSize {
-                        num_lines: self.core.screen_lines() as u16,
-                        num_cols: self.core.columns() as u16,
-                        cell_width: self.size.cell_width,
-                        cell_height: self.size.cell_height,
-                    }),
-                    _ => unreachable!("only protocol response events are queued"),
-                };
-                ensure!(
-                    response.len() <= MAX_INPUT_BYTES,
-                    "terminal response exceeds input limit"
-                );
-                if replies.len() + response.len() > MAX_INPUT_BYTES {
-                    respond(&replies)?;
-                    replies.clear();
+                    replies.extend_from_slice(response.as_bytes());
                 }
-                replies.extend_from_slice(response.as_bytes());
+            }
+            processed += slice.len();
+            if !continue_after_slice(slice.len()) {
+                break;
             }
         }
         if !replies.is_empty() {
             respond(&replies)?;
         }
-        Ok(())
+        Ok(processed)
     }
 }
 
@@ -248,6 +270,61 @@ mod tests {
             })
             .unwrap();
         assert_eq!(responses, b"\x1b[1;1R".repeat(1_000));
+    }
+
+    #[test]
+    fn short_slices_keep_query_replies_batched_and_flush_when_yielding() {
+        let mut terminal = TerminalState::new(GridSize::default());
+        let bytes = b"\x1b[6n".repeat(1_000);
+        let mut replies = Vec::new();
+        let mut slices = Vec::new();
+        let count = terminal
+            .advance_with_budget(
+                &bytes,
+                |reply| {
+                    replies.push(reply.to_vec());
+                    Ok(())
+                },
+                |size| {
+                    slices.push(size);
+                    true
+                },
+            )
+            .unwrap();
+        assert_eq!(count, bytes.len());
+        assert_eq!(replies.concat(), b"\x1b[1;1R".repeat(1_000));
+        assert_eq!(
+            replies.len(),
+            2,
+            "do not use one queue slot per parse slice"
+        );
+        assert!(slices.iter().all(|size| *size <= PARSE_BYTES));
+
+        let mut replies = Vec::new();
+        let count = terminal
+            .advance_with_budget(
+                &bytes,
+                |reply| {
+                    replies.extend_from_slice(reply);
+                    Ok(())
+                },
+                |_| false,
+            )
+            .unwrap();
+        assert_eq!(count, PARSE_BYTES);
+        assert_eq!(replies, b"\x1b[1;1R".repeat(PARSE_BYTES / 4));
+        let count2 = terminal
+            .advance_with_budget(
+                &bytes[count..],
+                |reply| {
+                    replies.extend_from_slice(reply);
+                    Ok(())
+                },
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(count + count2, bytes.len());
+        assert_eq!(replies, b"\x1b[1;1R".repeat(1_000));
     }
 
     #[test]

@@ -11,6 +11,8 @@ pub struct SessionDiagnostics {
     pub last_poll_duration: Duration,
     pub max_poll_duration: Duration,
     pub max_chunk_duration: Duration,
+    pub max_parse_duration: Duration,
+    pub max_parse_bytes: usize,
     pub budget_followups: u64,
     pub worker_wakeups: u64,
     pub output_backpressure_retries: u64,
