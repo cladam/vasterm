@@ -12,6 +12,9 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor};
 use portable_pty::CommandBuilder;
 use vasterm::session::{GridSize, Session, SessionState, TerminalSize};
 
+// Load completion is not a throughput gate on shared CI runners.
+const LOAD_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn fixture(scenario: &str) -> Session {
     fixture_with_wakeup(scenario, GridSize::default(), Arc::new(|| {}))
 }
@@ -28,8 +31,23 @@ fn fixture_with_wakeup(
 }
 
 fn wait_on_wakeup(session: &mut Session, wakeups: &Receiver<()>, ready: impl Fn(&Session) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    wait_on_wakeup_with_timeout(session, wakeups, Duration::from_secs(5), ready);
+}
+
+fn wait_on_wakeup_with_timeout(
+    session: &mut Session,
+    wakeups: &Receiver<()>,
+    timeout: Duration,
+    ready: impl Fn(&Session) -> bool,
+) {
+    let deadline = Instant::now() + timeout;
     while !ready(session) {
+        assert!(
+            Instant::now() < deadline,
+            "session completion timed out: {}; diagnostics: {:?}",
+            session.state(),
+            session.diagnostics()
+        );
         wakeups
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .expect("no repaint requested for pending session work");
@@ -306,7 +324,8 @@ fn saturated_output_on_a_larger_grid_preserves_lines_and_parse_bounds() {
 }
 
 fn assert_saturated_output(size: GridSize) {
-    let mut session = fixture_with_wakeup("numbered-output", size, Arc::new(|| {}));
+    let (wakeup, wakes) = repaint_channel();
+    let mut session = fixture_with_wakeup("numbered-output", size, wakeup);
     wait_for(&mut session, |s| {
         matches!(s.state(), SessionState::Running { .. })
     });
@@ -319,7 +338,7 @@ fn assert_saturated_output(size: GridSize) {
         );
         thread::sleep(Duration::from_millis(5));
     }
-    wait_for(&mut session, |s| {
+    wait_on_wakeup_with_timeout(&mut session, &wakes, LOAD_COMPLETION_TIMEOUT, |s| {
         matches!(s.state(), SessionState::Exited(_))
     });
     assert!(matches!(session.state(), SessionState::Exited(status) if status.success()));
@@ -399,7 +418,7 @@ fn saturated_output_budget_continues_without_a_polling_timer() {
         assert!(Instant::now() < deadline);
         thread::sleep(Duration::from_millis(5));
     }
-    wait_on_wakeup(&mut session, &wakes, |s| {
+    wait_on_wakeup_with_timeout(&mut session, &wakes, LOAD_COMPLETION_TIMEOUT, |s| {
         matches!(s.state(), SessionState::Exited(_))
     });
     let stats = session.diagnostics();
