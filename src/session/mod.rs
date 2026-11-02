@@ -1,3 +1,4 @@
+mod cleanup;
 mod diagnostics;
 mod terminal;
 mod transport;
@@ -13,6 +14,8 @@ use alacritty_terminal::Term;
 use anyhow::{Context, Result, bail, ensure};
 use portable_pty::{CommandBuilder, ExitStatus};
 
+use cleanup::CleanupControl;
+pub use cleanup::SHUTDOWN_GRACE;
 pub use diagnostics::SessionDiagnostics;
 use diagnostics::WorkerDiagnostics;
 use terminal::TerminalState;
@@ -33,6 +36,7 @@ pub enum SessionState {
     Starting,
     Running { pid: u32 },
     Draining,
+    Closing,
     Exited(ExitStatus),
     Failed(String),
     Closed,
@@ -44,6 +48,10 @@ impl fmt::Display for SessionState {
             Self::Starting => write!(f, "Starting local session..."),
             Self::Running { pid } => write!(f, "Session running (PID {pid})"),
             Self::Draining => write!(f, "Child exited; processing final terminal output..."),
+            Self::Closing => write!(
+                f,
+                "Closing session; terminating processes and joining worker..."
+            ),
             Self::Exited(status) => write!(f, "Session exited: {status}"),
             Self::Failed(error) => write!(f, "Session failed: {error}"),
             Self::Closed => write!(f, "Session closed"),
@@ -87,6 +95,9 @@ pub struct Session {
     started_at: Instant,
     diagnostics: SessionDiagnostics,
     worker_diagnostics: Arc<WorkerDiagnostics>,
+    cleanup: Arc<CleanupControl>,
+    cleanup_errors: Receiver<String>,
+    failure: Option<String>,
 }
 
 impl Session {
@@ -104,6 +115,9 @@ impl Session {
         let started_at = Instant::now();
         let worker_diagnostics = Arc::new(WorkerDiagnostics::default());
         let measurements = worker_diagnostics.clone();
+        let cleanup = Arc::new(CleanupControl::default());
+        let worker_cleanup = cleanup.clone();
+        let (cleanup_error_tx, cleanup_errors) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("vasterm-pty".into())
             .spawn(move || {
@@ -118,6 +132,8 @@ impl Session {
                         wakeup: &worker_wakeup,
                         diagnostics: &measurements,
                         started_at,
+                        cleanup: &worker_cleanup,
+                        cleanup_errors: &cleanup_error_tx,
                     },
                 );
                 // Disconnection means all PTY work and cleanup have finished.
@@ -144,6 +160,9 @@ impl Session {
             started_at,
             diagnostics: SessionDiagnostics::default(),
             worker_diagnostics,
+            cleanup,
+            cleanup_errors,
+            failure: None,
         })
     }
 
@@ -171,9 +190,6 @@ impl Session {
     /// While a resize is in flight, callers should retry their latest dimensions.
     pub fn resize(&mut self, size: TerminalSize) -> Result<()> {
         size.pty_size()?;
-        if self.resizing || size == self.terminal.size {
-            return Ok(());
-        }
         ensure!(
             matches!(
                 self.state,
@@ -181,6 +197,9 @@ impl Session {
             ),
             "cannot resize an inactive session"
         );
+        if self.resizing || size == self.terminal.size {
+            return Ok(());
+        }
         self.resize.try_send(size).context("queue PTY resize")?;
         self.resizing = true;
         Ok(())
@@ -227,7 +246,10 @@ impl Session {
             };
             match event {
                 Ok(Output::Started(pid)) => {
-                    if !matches!(self.state, SessionState::Failed(_) | SessionState::Closed) {
+                    if !matches!(
+                        self.state,
+                        SessionState::Failed(_) | SessionState::Closed | SessionState::Closing
+                    ) {
                         self.state = SessionState::Running { pid };
                     }
                 }
@@ -239,42 +261,44 @@ impl Session {
                     let allowance = (bytes.len() - offset).min(UPDATE_BYTES - processed);
                     let chunk_start = now();
                     let mut boundary = chunk_start;
-                    let count =
-                        if matches!(self.state, SessionState::Failed(_) | SessionState::Closed) {
-                            allowance
-                        } else {
-                            match self.terminal.advance_with_budget(
-                                &bytes[offset..offset + allowance],
-                                |response| {
-                                    // Draining a dead peer's final output requires no protocol reply.
-                                    if self.child_exited.load(Ordering::Acquire) {
-                                        return Ok(());
-                                    }
-                                    let result = enqueue_input(&self.input, response, None);
-                                    if self.child_exited.load(Ordering::Acquire) {
-                                        return Ok(());
-                                    }
-                                    result.context("send terminal response")
-                                },
-                                |slice_bytes| {
-                                    let end = now();
-                                    self.diagnostics.max_parse_duration = self
-                                        .diagnostics
-                                        .max_parse_duration
-                                        .max(end.duration_since(boundary));
-                                    self.diagnostics.max_parse_bytes =
-                                        self.diagnostics.max_parse_bytes.max(slice_bytes);
-                                    boundary = end;
-                                    end.duration_since(start) < UPDATE_TIME
-                                },
-                            ) {
-                                Ok(count) => count,
-                                Err(error) => {
-                                    self.fail(format!("{error:#}"));
-                                    allowance
+                    let count = if matches!(
+                        self.state,
+                        SessionState::Failed(_) | SessionState::Closed | SessionState::Closing
+                    ) {
+                        allowance
+                    } else {
+                        match self.terminal.advance_with_budget(
+                            &bytes[offset..offset + allowance],
+                            |response| {
+                                // Draining a dead peer's final output requires no protocol reply.
+                                if self.child_exited.load(Ordering::Acquire) {
+                                    return Ok(());
                                 }
+                                let result = enqueue_input(&self.input, response, None);
+                                if self.child_exited.load(Ordering::Acquire) {
+                                    return Ok(());
+                                }
+                                result.context("send terminal response")
+                            },
+                            |slice_bytes| {
+                                let end = now();
+                                self.diagnostics.max_parse_duration = self
+                                    .diagnostics
+                                    .max_parse_duration
+                                    .max(end.duration_since(boundary));
+                                self.diagnostics.max_parse_bytes =
+                                    self.diagnostics.max_parse_bytes.max(slice_bytes);
+                                boundary = end;
+                                end.duration_since(start) < UPDATE_TIME
+                            },
+                        ) {
+                            Ok(count) => count,
+                            Err(error) => {
+                                self.fail(format!("{error:#}"));
+                                allowance
                             }
-                        };
+                        }
+                    };
                     processed += count;
                     self.diagnostics.max_chunk_duration = self
                         .diagnostics
@@ -286,14 +310,20 @@ impl Session {
                 }
                 Ok(Output::Resized(size)) => {
                     self.resizing = false;
-                    if !matches!(self.state, SessionState::Failed(_) | SessionState::Closed) {
+                    if !matches!(
+                        self.state,
+                        SessionState::Failed(_) | SessionState::Closed | SessionState::Closing
+                    ) {
                         self.terminal.core.resize(size.grid);
                         self.terminal.size = size;
                         self.size = size.grid;
                     }
                 }
                 Ok(Output::Exited(status)) => {
-                    if !matches!(self.state, SessionState::Failed(_) | SessionState::Closed) {
+                    if !matches!(
+                        self.state,
+                        SessionState::Failed(_) | SessionState::Closed | SessionState::Closing
+                    ) {
                         self.state = SessionState::Exited(status);
                     }
                 }
@@ -312,14 +342,25 @@ impl Session {
                 Err(TryRecvError::Disconnected) => disconnected = true,
             }
         }
-        if (disconnected
-            || self
-                .worker
-                .as_ref()
-                .is_some_and(|worker| worker.is_finished()))
+        if let Ok(error) = self.cleanup_errors.try_recv() {
+            self.state = SessionState::Failed(error);
+        }
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
             && let Err(error) = self.join_worker()
         {
             self.fail(format!("{error:#}"));
+        }
+        if disconnected && self.worker.is_some() {
+            // Completion wake can race the thread's return; only join after is_finished.
+            (self.wakeup)();
+        }
+        if self.cleanup_complete() && matches!(self.state, SessionState::Closing) {
+            self.state = self.failure.as_ref().map_or(SessionState::Closed, |error| {
+                SessionState::Failed(error.clone())
+            });
         }
         if self.child_exited.load(Ordering::Acquire)
             && matches!(self.state, SessionState::Running { .. })
@@ -342,24 +383,63 @@ impl Session {
         }
     }
 
-    /// Cancels pending I/O, joins the worker, and reaps the child; buffered output is abandoned.
-    pub fn shutdown(&mut self) -> Result<()> {
+    /// Stops input immediately; worker cleanup completes asynchronously through `poll`.
+    /// Calling again after a visible cleanup failure retries with the same owned handles.
+    pub fn request_shutdown(&mut self) {
+        if matches!(self.state, SessionState::Closing) {
+            return;
+        }
+        if matches!(self.state, SessionState::Failed(_)) {
+            self.cleanup.request_retry();
+        }
         self.cancelled.store(true, Ordering::Release);
-        if let Err(error) = self.join_worker() {
-            self.fail(format!("{error:#}"));
-            return Err(error);
+        self.pending_bytes = None;
+        self.pending_output = None;
+        self.resizing = false;
+        if !matches!(self.state, SessionState::Exited(_)) {
+            self.state = if self.cleanup_complete() {
+                self.failure.as_ref().map_or(SessionState::Closed, |error| {
+                    SessionState::Failed(error.clone())
+                })
+            } else {
+                SessionState::Closing
+            };
         }
-        if !matches!(
-            self.state,
-            SessionState::Failed(_) | SessionState::Exited(_)
-        ) {
-            self.state = SessionState::Closed;
+        (self.wakeup)();
+    }
+
+    /// True only after the worker has released PTY ownership and has been joined.
+    pub fn cleanup_complete(&self) -> bool {
+        self.worker.is_none()
+    }
+
+    pub fn cleanup_failed(&self) -> bool {
+        self.cleanup.failed.load(Ordering::Acquire)
+    }
+
+    /// Blocking cleanup for tests/non-UI callers. Native UI uses `request_shutdown`.
+    pub fn shutdown(&mut self) -> Result<()> {
+        self.request_shutdown();
+        while !self.cleanup_complete() {
+            self.poll();
+            if self.cleanup_failed()
+                && let SessionState::Failed(error) = &self.state
+            {
+                bail!("{error}");
+            }
+            if !self.cleanup_complete() {
+                thread::sleep(Duration::from_millis(5));
+            }
         }
-        Ok(())
+        match &self.state {
+            SessionState::Failed(error) => bail!("{error}"),
+            _ => Ok(()),
+        }
     }
 
     fn fail(&mut self, error: String) {
         self.cancelled.store(true, Ordering::Release);
+        self.failure = Some(error.clone());
         self.state = SessionState::Failed(error);
     }
 
@@ -375,7 +455,9 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Err(error) = self.shutdown() {
+        self.cancelled.store(true, Ordering::Release);
+        self.cleanup.abandoning.store(true, Ordering::Release);
+        if let Err(error) = self.join_worker() {
             eprintln!("Vasterm: could not close session: {error:#}");
         }
     }
@@ -404,12 +486,14 @@ fn enqueue_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eframe::egui;
 
     fn test_session() -> (Session, Receiver<transport::Input>, SyncSender<Output>) {
         let (input, input_rx) = mpsc::sync_channel(QUEUE_CHUNKS);
         let (resize, _resize_rx) = mpsc::sync_channel(1);
         let (output_tx, output) = mpsc::sync_channel(QUEUE_CHUNKS);
         let size = GridSize::default();
+        let (_cleanup_tx, cleanup_errors) = mpsc::sync_channel(1);
         (
             Session {
                 terminal: TerminalState::new(size),
@@ -428,6 +512,9 @@ mod tests {
                 started_at: Instant::now(),
                 diagnostics: SessionDiagnostics::default(),
                 worker_diagnostics: Arc::new(WorkerDiagnostics::default()),
+                cleanup: Arc::new(CleanupControl::default()),
+                cleanup_errors,
+                failure: None,
             },
             input_rx,
             output_tx,
@@ -457,6 +544,164 @@ mod tests {
         session.poll();
         assert!(matches!(session.state(), SessionState::Failed(message)
             if message.contains("read PTY output: injected I/O failure")));
+    }
+
+    fn fault_session(fault: transport::tests::Fault) -> (Session, u32) {
+        let (mut session, input, output) = test_session();
+        let (resize, resize_rx) = mpsc::sync_channel(1);
+        session.resize = resize;
+        let (error_tx, error_rx) = mpsc::sync_channel(1);
+        session.cleanup_errors = error_rx;
+        session.send_input(b"x").unwrap();
+        let cancelled = session.cancelled.clone();
+        let child_exited = session.child_exited.clone();
+        let cleanup = session.cleanup.clone();
+        let diagnostics = session.worker_diagnostics.clone();
+        let wakeup = session.wakeup.clone();
+        let started_at = session.started_at;
+        let (pid_tx, pid_rx) = mpsc::sync_channel(1);
+        session.worker = Some(thread::spawn(move || {
+            transport::tests::run_with_fault(
+                fault,
+                (input, resize_rx),
+                &output,
+                &transport::WorkerContext {
+                    cancelled: &cancelled,
+                    child_exited: &child_exited,
+                    cleanup: &cleanup,
+                    diagnostics: &diagnostics,
+                    wakeup: &wakeup,
+                    started_at,
+                    cleanup_errors: &error_tx,
+                },
+                pid_tx,
+            )
+        }));
+        let pid = pid_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        (session, pid)
+    }
+
+    fn poll_until(session: &mut Session, ready: impl Fn(&Session) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !ready(session) {
+            session.poll();
+            assert!(Instant::now() < deadline, "{}", session.state());
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn failing_reads_and_writes_reap_the_child_and_paint_an_actionable_error() {
+        for (fault, message) in [
+            (
+                transport::tests::Fault::Read,
+                "read PTY output: injected read failure",
+            ),
+            (
+                transport::tests::Fault::Write,
+                "write PTY input: injected write failure",
+            ),
+        ] {
+            let (mut session, _) = fault_session(fault);
+            poll_until(&mut session, Session::cleanup_complete);
+            assert!(
+                matches!(session.state(), SessionState::Failed(error) if error.contains(message))
+            );
+            let mut app = crate::VastermApp {
+                session: Some(session),
+                startup_error: None,
+                surface: Default::default(),
+                interaction_error: None,
+                diagnostics: Default::default(),
+                closing_window: true,
+            };
+            let context = egui::Context::default();
+            let mut output = context.run_ui(egui::RawInput::default(), |ui| app.show(ui));
+            output.textures_delta.clear();
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::epaint::Shape::Text(text) if text.galley.text().contains(message))));
+            assert!(
+                output.viewport_output[&egui::ViewportId::ROOT]
+                    .commands
+                    .contains(&egui::ViewportCommand::CancelClose)
+            );
+            assert!(
+                !output.viewport_output[&egui::ViewportId::ROOT]
+                    .commands
+                    .contains(&egui::ViewportCommand::Close)
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_failure_retains_the_live_child_until_explicit_retry() {
+        let unavailable = Arc::new(AtomicBool::new(true));
+        let (mut session, pid) =
+            fault_session(transport::tests::Fault::Descriptor(unavailable.clone()));
+        poll_until(&mut session, |session| {
+            session.cleanup_failed() && matches!(session.state(), SessionState::Failed(_))
+        });
+        assert!(!session.cleanup_complete());
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0);
+        let mut app = crate::VastermApp {
+            session: Some(session),
+            startup_error: None,
+            surface: Default::default(),
+            interaction_error: None,
+            diagnostics: Default::default(),
+            closing_window: true,
+        };
+        let context = egui::Context::default();
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.show(ui));
+        output.textures_delta.clear();
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::epaint::Shape::Text(text) if text.galley.text() == "Retry cleanup")));
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        unavailable.store(false, Ordering::Release);
+        let session = app.session.as_mut().unwrap();
+        session.request_shutdown();
+        poll_until(session, Session::cleanup_complete);
+        assert!(!session.cleanup_failed());
+        assert!(matches!(session.state(), SessionState::Failed(error)
+            if error.contains("PTY descriptor unavailable")));
+    }
+
+    #[test]
+    fn final_drain_deadline_covers_non_eof_and_backpressured_noisy_readers() {
+        for noisy in [false, true] {
+            let started = Instant::now();
+            let (mut session, _) = fault_session(transport::tests::Fault::RetainedSlave(noisy));
+            if noisy {
+                thread::sleep(Duration::from_millis(2_200));
+            }
+            poll_until(&mut session, Session::cleanup_complete);
+            assert!(matches!(session.state(), SessionState::Failed(error)
+                if error.contains("drain exceeded two seconds") && error.contains("incomplete")));
+            assert!(started.elapsed() >= transport::FINAL_DRAIN_TIME);
+            assert!(started.elapsed() < Duration::from_secs(3));
+        }
+    }
+
+    #[test]
+    fn dropping_after_cleanup_validation_failure_still_reaps_the_owned_child() {
+        let (mut session, pid) = fault_session(transport::tests::Fault::Descriptor(Arc::new(
+            AtomicBool::new(true),
+        )));
+        poll_until(&mut session, |session| session.cleanup_failed());
+        drop(session);
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 
     #[test]

@@ -8,11 +8,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 
+use super::cleanup::{self, CleanupControl};
 use super::diagnostics::{WorkerDiagnostics, increment, nanoseconds};
 use super::{GridSize, MAX_INPUT_BYTES, TerminalSize, Wakeup};
 
 pub(super) const CHUNK_BYTES: usize = 4_096;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+pub const FINAL_DRAIN_TIME: Duration = Duration::from_secs(2);
+const EOF_EXIT_GRACE: Duration = Duration::from_millis(200);
 
 pub(super) struct Input {
     pub bytes: Vec<u8>,
@@ -25,6 +28,8 @@ pub(super) struct WorkerContext<'a> {
     pub wakeup: &'a Wakeup,
     pub diagnostics: &'a WorkerDiagnostics,
     pub started_at: Instant,
+    pub cleanup: &'a CleanupControl,
+    pub cleanup_errors: &'a SyncSender<String>,
 }
 
 impl WorkerContext<'_> {
@@ -48,18 +53,58 @@ pub(super) fn run(
     output: &SyncSender<Output>,
     context: &WorkerContext<'_>,
 ) -> Result<ExitStatus> {
-    let mut process = PtyProcess::spawn(command, size)?;
+    run_process(PtyProcess::spawn(command, size)?, commands, output, context)
+}
+
+fn run_process(
+    mut process: PtyProcess,
+    commands: (Receiver<Input>, Receiver<TerminalSize>),
+    output: &SyncSender<Output>,
+    context: &WorkerContext<'_>,
+) -> Result<ExitStatus> {
     let result = process.transfer(commands.0, commands.1, output, context);
-    let cleanup = process.stop();
-    if cleanup.is_ok() {
-        context.child_exited.store(true, Ordering::Release);
-    }
-    match (result, cleanup) {
-        (Err(error), Err(cleanup)) => {
-            Err(error.context(format!("session cleanup also failed: {cleanup:#}")))
+    loop {
+        match process.stop() {
+            Ok(status) => {
+                context.child_exited.store(true, Ordering::Release);
+                context.cleanup.failed.store(false, Ordering::Release);
+                return result.map(|_| status);
+            }
+            Err(error) => {
+                if context.cleanup.abandoning.load(Ordering::Acquire) {
+                    return Err(error).context("session cleanup failed during drop");
+                }
+                let message = match &result {
+                    Err(cause) => format!("{cause:#}; session cleanup also failed: {error:#}"),
+                    Ok(()) => format!("session cleanup failed: {error:#}"),
+                };
+                context.cleanup.failed.store(true, Ordering::Release);
+                let mut message = message;
+                loop {
+                    match context.cleanup_errors.try_send(message) {
+                        Ok(()) => break,
+                        Err(TrySendError::Full(pending)) => message = pending,
+                        Err(TrySendError::Disconnected(_)) => {
+                            bail!("cleanup error receiver disconnected: {error:#}");
+                        }
+                    }
+                    if context.cleanup.abandoning.load(Ordering::Acquire) {
+                        return Err(error)
+                            .context("session cleanup abandoned before reporting failure");
+                    }
+                    context.wake();
+                    thread::sleep(POLL_INTERVAL);
+                }
+                context.wake();
+                while !context.cleanup.retry.swap(false, Ordering::AcqRel) {
+                    if context.cleanup.abandoning.load(Ordering::Acquire) {
+                        return Err(error).context("session cleanup abandoned after failure");
+                    }
+                    thread::sleep(POLL_INTERVAL);
+                }
+                context.cleanup.failed.store(false, Ordering::Release);
+            }
         }
-        (Err(error), Ok(_)) => Err(error),
-        (Ok(()), status) => status,
     }
 }
 
@@ -69,6 +114,8 @@ struct PtyProcess {
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
     exit_status: Option<ExitStatus>,
+    foreground: Option<libc::pid_t>,
+    session_id: libc::pid_t,
 }
 
 impl PtyProcess {
@@ -93,12 +140,15 @@ impl PtyProcess {
             .spawn_command(command)
             .context("spawn session child")?;
         drop(pair.slave);
+        let session_id = child.process_id().context("session child has no PID")? as libc::pid_t;
         Ok(Self {
             child,
             reader,
             writer,
             master: pair.master,
             exit_status: None,
+            foreground: None,
+            session_id,
         })
     }
 
@@ -121,10 +171,17 @@ impl PtyProcess {
         let mut pending_input = None;
         let mut eof = false;
         let mut finishing = false;
+        let mut exited_at = None;
+        let mut eof_at = None;
 
         loop {
             if context.cancelled.load(Ordering::Acquire) {
                 return Ok(());
+            }
+            if exited_at.is_some_and(|start: Instant| start.elapsed() >= FINAL_DRAIN_TIME) {
+                bail!(
+                    "final PTY output drain exceeded two seconds; descendant may still hold the PTY or output is backpressured; final output may be incomplete"
+                );
             }
 
             if let Some(event) = pending_output.take() {
@@ -148,6 +205,7 @@ impl PtyProcess {
             if self.exit_status.is_none() {
                 self.exit_status = self.child.try_wait().context("check session child exit")?;
                 if self.exit_status.is_some() {
+                    exited_at = Some(Instant::now());
                     context.child_exited.store(true, Ordering::Release);
                 }
             }
@@ -201,19 +259,31 @@ impl PtyProcess {
             if pending_output.is_none() && !eof {
                 let mut bytes = vec![0; CHUNK_BYTES];
                 match self.reader.read(&mut bytes) {
-                    Ok(0) => eof = true,
+                    Ok(0) => {
+                        eof = true;
+                        eof_at = Some(Instant::now());
+                    }
                     Ok(count) => {
                         bytes.truncate(count);
                         pending_output = Some(Output::Bytes(bytes));
                         continue;
                     }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        // Do not wait forever for a descendant holding the slave after shell exit.
-                        eof = self.exit_status.is_some();
-                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                        // Unix PTY masters can report the closed slave as EIO instead of read(0).
+                        eof = true;
+                        eof_at = Some(Instant::now());
+                    }
                     Err(error) => return Err(error).context("read PTY output"),
                 }
+            }
+            if self.exit_status.is_none()
+                && eof_at.is_some_and(|start| start.elapsed() >= EOF_EXIT_GRACE)
+            {
+                bail!(
+                    "PTY reached EOF but the owned child is still running; terminating the session"
+                );
             }
 
             if let Some(status) = self.exit_status.as_ref()
@@ -234,31 +304,13 @@ impl PtyProcess {
     }
 
     fn stop(&mut self) -> Result<ExitStatus> {
-        if let Some(status) = self.exit_status.as_ref() {
-            return Ok(status.clone());
-        }
-        if let Some(status) = self
-            .child
-            .try_wait()
-            .context("check child before shutdown")?
-        {
-            self.exit_status = Some(status.clone());
-            return Ok(status);
-        }
-        if let Err(error) = self.child.kill() {
-            if let Some(status) = self
-                .child
-                .try_wait()
-                .context("check child after termination race")?
-            {
-                self.exit_status = Some(status.clone());
-                return Ok(status);
-            }
-            return Err(error).context("terminate session child");
-        }
-        let status = self.child.wait().context("reap session child")?;
-        self.exit_status = Some(status.clone());
-        Ok(status)
+        cleanup::stop(
+            &mut *self.child,
+            &*self.master,
+            &mut self.exit_status,
+            &mut self.foreground,
+            self.session_id,
+        )
     }
 }
 
@@ -266,6 +318,11 @@ impl Drop for PtyProcess {
     fn drop(&mut self) {
         if let Err(error) = self.stop() {
             eprintln!("Vasterm: session cleanup failed: {error:#}");
+            if let Err(error) =
+                cleanup::stop_child(&mut *self.child, &mut self.exit_status, self.session_id)
+            {
+                eprintln!("Vasterm: emergency direct-child cleanup failed: {error:#}");
+            }
         }
     }
 }
@@ -335,8 +392,134 @@ impl PendingWrite {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    struct FailingIo;
+
+    struct RetainedSlave {
+        noisy: bool,
+    }
+
+    impl Read for RetainedSlave {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            if self.noisy {
+                bytes.fill(b'x');
+                Ok(bytes.len())
+            } else {
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+        }
+    }
+
+    impl Read for FailingIo {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("injected read failure"))
+        }
+    }
+
+    impl Write for FailingIo {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("injected write failure"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct UnavailableDescriptor {
+        master: Option<Box<dyn MasterPty + Send>>,
+        unavailable: Arc<AtomicBool>,
+    }
+
+    impl UnavailableDescriptor {
+        fn master(&self) -> &dyn MasterPty {
+            self.master.as_deref().unwrap()
+        }
+    }
+
+    impl MasterPty for UnavailableDescriptor {
+        fn resize(&self, size: PtySize) -> Result<()> {
+            self.master().resize(size)
+        }
+        fn get_size(&self) -> Result<PtySize> {
+            self.master().get_size()
+        }
+        fn try_clone_reader(&self) -> Result<Box<dyn Read + Send>> {
+            self.master().try_clone_reader()
+        }
+        fn take_writer(&self) -> Result<Box<dyn Write + Send>> {
+            self.master().take_writer()
+        }
+        fn process_group_leader(&self) -> Option<libc::pid_t> {
+            self.master().process_group_leader()
+        }
+        fn as_raw_fd(&self) -> Option<RawFd> {
+            if self.unavailable.load(Ordering::Acquire) {
+                None
+            } else {
+                self.master().as_raw_fd()
+            }
+        }
+        fn tty_name(&self) -> Option<std::path::PathBuf> {
+            self.master().tty_name()
+        }
+    }
+
+    pub(in crate::session) enum Fault {
+        Read,
+        Write,
+        Descriptor(Arc<AtomicBool>),
+        RetainedSlave(bool),
+    }
+
+    pub(in crate::session) fn run_with_fault(
+        fault: Fault,
+        commands: (Receiver<Input>, Receiver<TerminalSize>),
+        output: &SyncSender<Output>,
+        context: &WorkerContext<'_>,
+        pid_sender: SyncSender<u32>,
+    ) -> Result<ExitStatus> {
+        let command = CommandBuilder::new(if matches!(fault, Fault::RetainedSlave(_)) {
+            "/usr/bin/true"
+        } else {
+            "/bin/cat"
+        });
+        let mut process = PtyProcess::spawn(command, GridSize::default())?;
+        let pid = process.child.process_id().unwrap();
+        pid_sender.send(pid).unwrap();
+        match fault {
+            Fault::Read => process.reader = Box::new(FailingIo),
+            Fault::Write => process.writer = Box::new(FailingIo),
+            Fault::RetainedSlave(noisy) => process.reader = Box::new(RetainedSlave { noisy }),
+            Fault::Descriptor(unavailable) => {
+                let master = std::mem::replace(
+                    &mut process.master,
+                    Box::new(UnavailableDescriptor {
+                        master: None,
+                        unavailable,
+                    }),
+                );
+                let wrapper: &mut dyn MasterPty = process.master.as_mut();
+                wrapper
+                    .downcast_mut::<UnavailableDescriptor>()
+                    .unwrap()
+                    .master = Some(master);
+            }
+        }
+        let result = run_process(process, commands, output, context);
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        result
+    }
 
     #[test]
     fn partial_writes_and_backpressure_preserve_bytes() {

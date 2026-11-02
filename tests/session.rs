@@ -1,6 +1,7 @@
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -250,7 +251,10 @@ fn output_backpressure_does_not_block_shutdown() {
     // Deliberately stop consuming output so the bounded queue fills.
     thread::sleep(Duration::from_millis(150));
     let start = Instant::now();
-    session.shutdown().unwrap();
+    session.request_shutdown();
+    assert!(start.elapsed() < Duration::from_millis(50));
+    wait_for(&mut session, Session::cleanup_complete);
+    assert!(matches!(session.state(), SessionState::Closed));
     assert!(start.elapsed() < Duration::from_secs(2));
 }
 
@@ -435,6 +439,215 @@ fn assert_reaped(pid: u32) {
     );
 }
 
+#[test]
+fn requested_shutdown_is_nonblocking_idempotent_and_rejects_new_work() {
+    let mut session = fixture("ignore-hangup");
+    wait_for(&mut session, |s| screen(s).contains("READY"));
+    let SessionState::Running { pid } = *session.state() else {
+        panic!("{}", session.state())
+    };
+    let started = Instant::now();
+    session.request_shutdown();
+    assert!(started.elapsed() < Duration::from_millis(50));
+    assert!(matches!(session.state(), SessionState::Closing));
+    assert!(!session.cleanup_complete());
+    assert!(session.send_input(b"x").is_err());
+    assert!(
+        session
+            .resize(TerminalSize {
+                grid: GridSize::default(),
+                cell_width: 0,
+                cell_height: 0,
+            })
+            .is_err()
+    );
+    session.request_shutdown();
+    session.poll();
+    assert!(!session.cleanup_complete());
+    wait_for(&mut session, Session::cleanup_complete);
+    assert!(matches!(session.state(), SessionState::Closed));
+    assert!(started.elapsed() >= vasterm::session::SHUTDOWN_GRACE);
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_reaped(pid);
+}
+
+#[test]
+fn requested_shutdown_can_cancel_startup() {
+    let mut session = fixture("idle");
+    session.request_shutdown();
+    wait_for(&mut session, Session::cleanup_complete);
+    assert!(matches!(session.state(), SessionState::Closed));
+}
+
+#[test]
+fn requested_shutdown_terminates_the_owned_foreground_job() {
+    for scenario in [
+        "foreground",
+        "foreground-ignore-hup",
+        "foreground-leaderless",
+    ] {
+        let mut session = fixture(scenario);
+        wait_for(&mut session, |s| screen(s).contains(":READY"));
+        let SessionState::Running { pid } = *session.state() else {
+            panic!("{}", session.state())
+        };
+        let contents = screen(&session);
+        let job: i32 = contents
+            .split("JOB:")
+            .nth(1)
+            .unwrap()
+            .split(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let group: i32 = contents
+            .split("GROUP:")
+            .nth(1)
+            .unwrap()
+            .split(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_ne!(job, pid as i32);
+        assert_eq!(unsafe { libc::getsid(job) }, pid as i32);
+        assert_eq!(unsafe { libc::getpgid(job) }, group);
+        if scenario == "foreground-leaderless" {
+            assert_ne!(job, group);
+            assert_eq!(unsafe { libc::getsid(group) }, -1);
+        }
+        session.request_shutdown();
+        wait_for(&mut session, Session::cleanup_complete);
+        assert!(matches!(session.state(), SessionState::Closed));
+        assert_reaped(pid);
+        assert_eq!(
+            unsafe { libc::kill(job, 0) },
+            -1,
+            "foreground job remains alive"
+        );
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    }
+}
+
+#[test]
+fn eof_with_a_live_child_is_an_error_and_reaps_the_child() {
+    let mut session = fixture("live-eof");
+    wait_for(&mut session, |s| screen(s).contains("READY"));
+    let SessionState::Running { pid } = *session.state() else {
+        panic!("{}", session.state())
+    };
+    wait_for(&mut session, |s| {
+        matches!(s.state(), SessionState::Failed(_))
+    });
+    assert!(matches!(session.state(), SessionState::Failed(message)
+        if message.contains("PTY reached EOF") && message.contains("still running")));
+    assert!(session.cleanup_complete());
+    assert_reaped(pid);
+}
+
+static HANGUP_RECEIVED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn record_hangup(_: libc::c_int) {
+    HANGUP_RECEIVED.store(true, Ordering::Relaxed);
+}
+
+fn spawn_foreground_job(group: i32, ignore_hangup: bool) -> std::process::Child {
+    let mut job = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "pty_child_fixture", "--nocapture"])
+        .env("VASTERM_TEST_SCENARIO", "foreground-job")
+        .env(
+            "VASTERM_TEST_IGNORE_HUP",
+            if ignore_hangup { "1" } else { "0" },
+        )
+        .process_group(group)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut job_output = io::BufReader::new(job.stdout.take().unwrap());
+    let mut line = String::new();
+    while !line.contains("JOB_READY") {
+        line.clear();
+        assert_ne!(job_output.read_line(&mut line).unwrap(), 0);
+    }
+    job
+}
+
+struct DescendantGuard {
+    pid: i32,
+    session: i32,
+}
+
+impl Drop for DescendantGuard {
+    fn drop(&mut self) {
+        if unsafe { libc::getsid(self.pid) } == self.session
+            && unsafe { libc::getpgid(self.pid) } == self.pid
+        {
+            unsafe {
+                libc::kill(self.pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[test]
+fn descendants_retaining_slave_descriptors_do_not_prevent_bounded_completion() {
+    for scenario in ["held-descendant-parent", "noisy-descendant-parent"] {
+        let started = Instant::now();
+        let mut session = fixture(scenario);
+        wait_for(&mut session, |s| screen(s).contains(":READY"));
+        let contents = screen(&session);
+        let descendant: i32 = contents
+            .split("DESC:")
+            .nth(1)
+            .unwrap()
+            .split(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let root: u32 = contents
+            .split("ROOT:")
+            .nth(1)
+            .unwrap()
+            .split(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let guard = DescendantGuard {
+            pid: descendant,
+            session: root as i32,
+        };
+        assert_eq!(unsafe { libc::getsid(descendant) }, root as i32);
+        // Stop UI consumption to include the backpressured case.
+        if scenario == "noisy-descendant-parent" {
+            thread::sleep(Duration::from_millis(2_200));
+        }
+        wait_for(&mut session, |s| {
+            matches!(s.state(), SessionState::Failed(_) | SessionState::Exited(_))
+        });
+        match session.state() {
+            SessionState::Failed(error) => {
+                assert!(
+                    error.contains("drain exceeded two seconds") && error.contains("incomplete")
+                );
+                assert!(started.elapsed() >= Duration::from_secs(2));
+            }
+            // macOS can revoke the slave on leader exit despite retained descriptors.
+            SessionState::Exited(status) => assert!(status.success()),
+            state => panic!("{state}"),
+        }
+        assert!(started.elapsed() < Duration::from_millis(3_500));
+        wait_for(&mut session, Session::cleanup_complete);
+        assert!(session.cleanup_complete());
+        assert_reaped(root);
+        // This is a background, not foreground, group. The test owns its cleanup;
+        // Vasterm neither promises to terminate it nor can reap this grandchild.
+        drop(guard);
+    }
+}
+
 // Spawn this test executable as the PTY child, without introducing a shipped fixture binary.
 #[test]
 fn pty_child_fixture() {
@@ -554,6 +767,112 @@ fn pty_child_fixture() {
             loop {
                 thread::sleep(Duration::from_secs(60));
             }
+        }
+        "live-eof" => {
+            stdout.write_all(b"READY").unwrap();
+            stdout.flush().unwrap();
+            thread::sleep(Duration::from_millis(100));
+            unsafe {
+                for fd in 0..=2 {
+                    assert_eq!(libc::close(fd), 0);
+                }
+            }
+            loop {
+                thread::sleep(Duration::from_secs(60));
+            }
+        }
+        "foreground" | "foreground-ignore-hup" | "foreground-leaderless" => {
+            unsafe {
+                libc::signal(
+                    libc::SIGHUP,
+                    record_hangup as *const () as libc::sighandler_t,
+                );
+                libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            }
+            let mut job = spawn_foreground_job(0, scenario != "foreground");
+            let group = job.id() as i32;
+            unsafe {
+                assert_eq!(libc::tcsetpgrp(0, group), 0);
+            }
+            if scenario == "foreground-leaderless" {
+                let member = spawn_foreground_job(group, true);
+                job.kill().unwrap();
+                job.wait().unwrap();
+                job = member;
+            }
+            write!(stdout, "GROUP:{group}:JOB:{}:READY", job.id()).unwrap();
+            stdout.flush().unwrap();
+            loop {
+                if HANGUP_RECEIVED.load(Ordering::Relaxed) && job.try_wait().unwrap().is_some() {
+                    std::process::exit(0);
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        "foreground-job" => {
+            unsafe {
+                libc::signal(
+                    libc::SIGHUP,
+                    if std::env::var("VASTERM_TEST_IGNORE_HUP").unwrap() == "1" {
+                        libc::SIG_IGN
+                    } else {
+                        libc::SIG_DFL
+                    },
+                );
+            }
+            stdout.write_all(b"JOB_READY\n").unwrap();
+            stdout.flush().unwrap();
+            // A bounded fixture lifetime prevents an orphan after an assertion failure.
+            thread::sleep(Duration::from_secs(5));
+        }
+        "held-descendant-parent" | "noisy-descendant-parent" => {
+            unsafe {
+                libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            }
+            let mut descendant = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "pty_child_fixture", "--nocapture"])
+                .env("VASTERM_TEST_SCENARIO", "bounded-descendant")
+                .env(
+                    "VASTERM_TEST_NOISY",
+                    if scenario == "noisy-descendant-parent" {
+                        "1"
+                    } else {
+                        "0"
+                    },
+                )
+                .stdout(std::process::Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let mut ready = io::BufReader::new(descendant.stdout.take().unwrap());
+            let mut line = String::new();
+            while !line.contains("DESC_READY") {
+                line.clear();
+                assert_ne!(ready.read_line(&mut line).unwrap(), 0);
+            }
+            write!(
+                stdout,
+                "DESC:{}:ROOT:{}:READY",
+                descendant.id(),
+                std::process::id()
+            )
+            .unwrap();
+            stdout.flush().unwrap();
+            std::process::exit(0);
+        }
+        "bounded-descendant" => {
+            stdout.write_all(b"DESC_READY\n").unwrap();
+            stdout.flush().unwrap();
+            thread::sleep(Duration::from_millis(150));
+            let deadline = Instant::now() + Duration::from_secs(4);
+            let noisy = std::env::var("VASTERM_TEST_NOISY").unwrap() == "1";
+            while Instant::now() < deadline {
+                if noisy && io::stderr().write_all(&[b'x'; 4096]).is_err() {
+                    std::process::exit(0);
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            std::process::exit(0);
         }
         "flood" => {
             let bytes = [b'x'; 4096];

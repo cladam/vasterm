@@ -18,6 +18,7 @@ pub struct VastermApp {
     surface: surface::TerminalSurface,
     interaction_error: Option<String>,
     diagnostics: UiDiagnostics,
+    closing_window: bool,
 }
 
 #[derive(Default)]
@@ -45,6 +46,7 @@ impl VastermApp {
                 surface: Default::default(),
                 interaction_error: None,
                 diagnostics: UiDiagnostics::default(),
+                closing_window: false,
             },
             Err(error) => Self {
                 session: None,
@@ -52,11 +54,45 @@ impl VastermApp {
                 surface: Default::default(),
                 interaction_error: None,
                 diagnostics: UiDiagnostics::default(),
+                closing_window: false,
             },
         }
     }
 
+    fn handle_window_close(&mut self, context: &egui::Context) {
+        if context.input(|input| input.viewport().close_requested()) {
+            let Some(session) = self.session.as_mut() else {
+                return;
+            };
+            if session.cleanup_complete() && !self.closing_window {
+                return;
+            }
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if !self.closing_window {
+                session.request_shutdown();
+                self.closing_window = true;
+            }
+        }
+        if self.closing_window
+            && let Some(session) = self.session.as_ref()
+        {
+            if (session.cleanup_failed() || session.cleanup_complete())
+                && let SessionState::Failed(error) = session.state()
+            {
+                self.interaction_error = Some(format!(
+                    "Window remains open: {error}. Retry cleanup if offered, or close again once cleanup is complete."
+                ));
+                self.closing_window = false;
+                context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            } else if session.cleanup_complete() {
+                self.closing_window = false;
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
     fn show(&mut self, ui: &mut egui::Ui) {
+        self.handle_window_close(ui.ctx());
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(error) = &self.startup_error {
                 ui.colored_label(egui::Color32::LIGHT_RED, format!("Session failed: {error}"));
@@ -77,11 +113,13 @@ impl VastermApp {
                     ));
                     if matches!(
                         session.state(),
-                        SessionState::Starting | SessionState::Running { .. }
-                    ) && ui.button("Stop session").clicked()
-                        && let Err(error) = session.shutdown()
-                    {
-                        self.interaction_error = Some(format!("Could not stop session: {error:#}"));
+                        SessionState::Starting | SessionState::Running { .. } | SessionState::Draining
+                    ) && ui.button("Stop session").clicked() {
+                        session.request_shutdown();
+                    }
+                    if session.cleanup_failed() && ui.button("Retry cleanup").clicked() {
+                        session.request_shutdown();
+                        self.interaction_error = None;
                     }
                 });
             }
@@ -158,9 +196,9 @@ impl eframe::App for VastermApp {
 
     fn on_exit(&mut self) {
         if let Some(session) = self.session.as_mut()
-            && let Err(error) = session.shutdown()
+            && !session.cleanup_complete()
         {
-            eprintln!("Vasterm: shutdown failed: {error:#}");
+            session.request_shutdown();
         }
     }
 }
@@ -310,6 +348,7 @@ mod tests {
             surface: Default::default(),
             interaction_error: None,
             diagnostics: UiDiagnostics::default(),
+            closing_window: false,
         };
         let mut output = context.run_ui(egui::RawInput::default(), |ui| app.show(ui));
         output.textures_delta.clear();
@@ -329,6 +368,7 @@ mod tests {
             surface: Default::default(),
             interaction_error: None,
             diagnostics: UiDiagnostics::default(),
+            closing_window: false,
         };
         let mut output = context.run_ui(egui::RawInput::default(), |ui| app.show(ui));
         // This headless test inspects paint output without uploading textures.
@@ -338,5 +378,100 @@ mod tests {
             matches!(&shape.shape, egui::epaint::Shape::Text(text)
                 if text.galley.text() == "Session failed: test shell could not start")
         }));
+    }
+
+    fn close_input() -> egui::RawInput {
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        input
+    }
+
+    #[test]
+    fn native_close_is_cancelled_until_worker_cleanup_finishes() {
+        let context = egui::Context::default();
+        let session = Session::spawn(
+            portable_pty::CommandBuilder::new("/bin/cat"),
+            GridSize::default(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let mut app = VastermApp {
+            session: Some(session),
+            startup_error: None,
+            surface: Default::default(),
+            interaction_error: None,
+            diagnostics: Default::default(),
+            closing_window: false,
+        };
+        let mut output = context.run_ui(close_input(), |ui| app.show(ui));
+        output.textures_delta.clear();
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        assert!(app.closing_window);
+        wait_for(app.session.as_mut().unwrap(), Session::cleanup_complete);
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.show(ui));
+        output.textures_delta.clear();
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close)
+        );
+        assert!(!app.closing_window);
+    }
+
+    #[test]
+    fn native_close_keeps_a_failed_session_visible_until_a_second_close_request() {
+        let context = egui::Context::default();
+        let session = Session::spawn(
+            portable_pty::CommandBuilder::new("/vasterm-test-does-not-exist/shell"),
+            GridSize::default(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let mut app = VastermApp {
+            session: Some(session),
+            startup_error: None,
+            surface: Default::default(),
+            interaction_error: None,
+            diagnostics: Default::default(),
+            closing_window: false,
+        };
+        let mut output = context.run_ui(close_input(), |ui| app.show(ui));
+        output.textures_delta.clear();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !app.session.as_ref().unwrap().cleanup_complete() {
+            app.session.as_mut().unwrap().poll();
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.show(ui));
+        output.textures_delta.clear();
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        assert!(
+            !output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close)
+        );
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::epaint::Shape::Text(text)
+            if text.galley.text().contains("Window remains open:") && text.galley.text().contains("spawn session child"))));
+        let mut output = context.run_ui(close_input(), |ui| app.show(ui));
+        output.textures_delta.clear();
+        assert!(
+            !output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
     }
 }
