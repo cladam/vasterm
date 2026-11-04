@@ -607,14 +607,7 @@ mod tests {
             assert!(
                 matches!(session.state(), SessionState::Failed(error) if error.contains(message))
             );
-            let mut app = crate::VastermApp {
-                session: Some(session),
-                startup_error: None,
-                surface: Default::default(),
-                interaction_error: None,
-                diagnostics: Default::default(),
-                closing_window: true,
-            };
+            let mut app = crate::VastermApp::with_single_session(session, true);
             let context = egui::Context::default();
             let mut output = context.run_ui(egui::RawInput::default(), |ui| app.show(ui));
             output.textures_delta.clear();
@@ -643,14 +636,7 @@ mod tests {
         });
         assert!(!session.cleanup_complete());
         assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0);
-        let mut app = crate::VastermApp {
-            session: Some(session),
-            startup_error: None,
-            surface: Default::default(),
-            interaction_error: None,
-            diagnostics: Default::default(),
-            closing_window: true,
-        };
+        let mut app = crate::VastermApp::with_single_session(session, true);
         let context = egui::Context::default();
         let mut output = context.run_ui(egui::RawInput::default(), |ui| app.show(ui));
         output.textures_delta.clear();
@@ -662,7 +648,7 @@ mod tests {
                 .contains(&egui::ViewportCommand::CancelClose)
         );
         unavailable.store(false, Ordering::Release);
-        let session = app.session.as_mut().unwrap();
+        let session = app.workspace.panes[0].session.as_mut().unwrap();
         session.request_shutdown();
         poll_until(session, Session::cleanup_complete);
         assert!(!session.cleanup_failed());

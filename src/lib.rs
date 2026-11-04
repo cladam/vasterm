@@ -1,24 +1,24 @@
 mod input;
 pub mod session;
 mod surface;
+pub mod workspace;
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 
+pub use workspace::{Pane, PaneId, Workspace};
+
 use session::{
-    GridSize, MAX_INPUT_BYTES, PARSE_BYTES, QUEUE_CHUNKS, SCROLLBACK_LINES, Session, SessionState,
-    UPDATE_BYTES, UPDATE_TIME, local_shell_command,
+    MAX_INPUT_BYTES, PARSE_BYTES, QUEUE_CHUNKS, SCROLLBACK_LINES, Session, UPDATE_BYTES,
+    UPDATE_TIME,
 };
 
 pub struct VastermApp {
-    session: Option<Session>,
-    startup_error: Option<String>,
-    surface: surface::TerminalSurface,
-    interaction_error: Option<String>,
+    pub workspace: Workspace,
+    pub interaction_error: Option<String>,
     diagnostics: UiDiagnostics,
-    closing_window: bool,
+    pub closing_window: bool,
 }
 
 #[derive(Default)]
@@ -31,60 +31,60 @@ struct UiDiagnostics {
 
 impl VastermApp {
     pub fn new(context: &egui::Context) -> Self {
-        let context = context.clone();
-        let result = local_shell_command().and_then(|command| {
-            Session::spawn(
-                command,
-                GridSize::default(),
-                Arc::new(move || context.request_repaint()),
-            )
-        });
-        match result {
-            Ok(session) => Self {
-                session: Some(session),
-                startup_error: None,
-                surface: Default::default(),
-                interaction_error: None,
-                diagnostics: UiDiagnostics::default(),
-                closing_window: false,
-            },
-            Err(error) => Self {
-                session: None,
-                startup_error: Some(format!("{error:#}")),
-                surface: Default::default(),
-                interaction_error: None,
-                diagnostics: UiDiagnostics::default(),
-                closing_window: false,
-            },
+        Self {
+            workspace: Workspace::two_panes(context),
+            interaction_error: None,
+            diagnostics: UiDiagnostics::default(),
+            closing_window: false,
+        }
+    }
+
+    pub fn from_workspace(workspace: Workspace) -> Self {
+        Self {
+            workspace,
+            interaction_error: None,
+            diagnostics: UiDiagnostics::default(),
+            closing_window: false,
+        }
+    }
+
+    pub fn with_single_session(session: Session, closing_window: bool) -> Self {
+        Self {
+            workspace: Workspace::from_panes(vec![Pane::with_session(PaneId(0), session)]),
+            interaction_error: None,
+            diagnostics: UiDiagnostics::default(),
+            closing_window,
+        }
+    }
+
+    pub fn with_startup_error(error: String) -> Self {
+        Self {
+            workspace: Workspace::from_panes(vec![Pane::with_error(PaneId(0), error)]),
+            interaction_error: None,
+            diagnostics: UiDiagnostics::default(),
+            closing_window: false,
         }
     }
 
     fn handle_window_close(&mut self, context: &egui::Context) {
         if context.input(|input| input.viewport().close_requested()) {
-            let Some(session) = self.session.as_mut() else {
-                return;
-            };
-            if session.cleanup_complete() && !self.closing_window {
+            if self.workspace.all_cleanups_complete() && !self.closing_window {
                 return;
             }
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             if !self.closing_window {
-                session.request_shutdown();
+                self.workspace.request_shutdown_all();
                 self.closing_window = true;
             }
         }
-        if self.closing_window
-            && let Some(session) = self.session.as_ref()
-        {
-            if (session.cleanup_failed() || session.cleanup_complete())
-                && let SessionState::Failed(error) = session.state()
-            {
+        if self.closing_window {
+            if let Some(failed_msg) = self.workspace.any_cleanup_failed() {
                 self.interaction_error = Some(format!(
-                    "Window remains open: {error}. Retry cleanup if offered, or close again once cleanup is complete."
+                    "Window remains open: {failed_msg}. Retry cleanup if offered, or close again once cleanup is complete."
                 ));
                 self.closing_window = false;
                 context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            } else if session.cleanup_complete() {
+            } else if self.workspace.all_cleanups_complete() {
                 self.closing_window = false;
                 context.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -94,84 +94,59 @@ impl VastermApp {
     fn show(&mut self, ui: &mut egui::Ui) {
         self.handle_window_close(ui.ctx());
         egui::CentralPanel::default().show(ui, |ui| {
-            if let Some(error) = &self.startup_error {
-                ui.colored_label(egui::Color32::LIGHT_RED, format!("Session failed: {error}"));
-            }
-            if let Some(session) = self.session.as_mut() {
-                let color = if matches!(session.state(), SessionState::Failed(_)) {
-                    egui::Color32::LIGHT_RED
-                } else {
-                    ui.visuals().text_color()
-                };
-                ui.horizontal(|ui| {
-                    ui.colored_label(color, session.state().to_string());
-                    ui.label(format!(
-                        "{} x {} | {:.2} px/point",
-                        session.size().columns(),
-                        session.size().rows(),
-                        ui.ctx().pixels_per_point()
-                    ));
-                    if matches!(
-                        session.state(),
-                        SessionState::Starting | SessionState::Running { .. } | SessionState::Draining
-                    ) && ui.button("Stop session").clicked() {
-                        session.request_shutdown();
-                    }
-                    if session.cleanup_failed() && ui.button("Retry cleanup").clicked() {
-                        session.request_shutdown();
-                        self.interaction_error = None;
-                    }
-                });
-            }
             if let Some(error) = &self.interaction_error {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
                 if ui.button("Dismiss error").clicked() {
                     self.interaction_error = None;
                 }
             }
-            if let Some(session) = &self.session {
-                    ui.collapsing("Load diagnostics", |ui| {
-                        let stats = session.diagnostics();
-                        ui.label(format!(
-                            "Logic passes: {} | UI passes: {} | Worker wakes: {} | Budget follow-ups: {}",
-                            self.diagnostics.logic_passes, self.diagnostics.ui_passes,
-                            stats.worker_wakeups, stats.budget_followups,
-                        ));
-                        ui.label(format!(
-                            "Processed: {} bytes | Last/max update: {}/{} bytes | Backpressure retries: {}",
-                            stats.processed_bytes, stats.last_update_bytes, stats.max_update_bytes,
-                            stats.output_backpressure_retries,
-                        ));
-                        ui.label(format!(
-                            "Max poll/chunk/parse slice: {:.3}/{:.3}/{:.3} ms | Max logic/UI: {:.3}/{:.3} ms",
-                            stats.max_poll_duration.as_secs_f64() * 1_000.0,
-                            stats.max_chunk_duration.as_secs_f64() * 1_000.0,
-                            stats.max_parse_duration.as_secs_f64() * 1_000.0,
-                            self.diagnostics.max_logic_duration.as_secs_f64() * 1_000.0,
-                            self.diagnostics.max_ui_duration.as_secs_f64() * 1_000.0,
-                        ));
-                        ui.label(format!(
-                            "Delivered user inputs: {} | Last/max delivery latency: {:.3}/{:.3} ms | Last delivery: {:.3} s after session start",
-                            stats.delivered_inputs,
-                            stats.last_input_latency.as_secs_f64() * 1_000.0,
-                            stats.max_input_latency.as_secs_f64() * 1_000.0,
-                            stats.last_input_delivered_at.as_secs_f64(),
-                        ));
-                        ui.label(format!(
-                            "Input queue: {} x {} bytes | History: {} lines | Update: {} bytes / soft {} ms | Parse slice: {} bytes",
-                            QUEUE_CHUNKS, MAX_INPUT_BYTES, SCROLLBACK_LINES,
-                            UPDATE_BYTES, UPDATE_TIME.as_millis(), PARSE_BYTES,
-                        ));
-                        ui.label("Passive counters; no repaint timer. PTY delivery is not proof of child receipt.");
-                    });
+            if !self.workspace.panes.is_empty() {
+                ui.collapsing("Load diagnostics", |ui| {
+                    ui.label(format!(
+                        "Logic passes: {} | UI passes: {} | Max logic/UI: {:.3}/{:.3} ms",
+                        self.diagnostics.logic_passes,
+                        self.diagnostics.ui_passes,
+                        self.diagnostics.max_logic_duration.as_secs_f64() * 1_000.0,
+                        self.diagnostics.max_ui_duration.as_secs_f64() * 1_000.0,
+                    ));
+                    ui.label(format!(
+                        "Input queue: {} x {} bytes | History: {} lines | Update: {} bytes / soft {} ms | Parse slice: {} bytes",
+                        QUEUE_CHUNKS, MAX_INPUT_BYTES, SCROLLBACK_LINES,
+                        UPDATE_BYTES, UPDATE_TIME.as_millis(), PARSE_BYTES,
+                    ));
+                    ui.label("Passive counters; no repaint timer. PTY delivery is not proof of child receipt.");
+                    for (i, pane) in self.workspace.panes.iter().enumerate() {
+                        if let Some(session) = &pane.session {
+                            ui.separator();
+                            ui.label(format!("Pane {}:", i + 1));
+                            let stats = session.diagnostics();
+                            ui.label(format!(
+                                "Worker wakes: {} | Budget follow-ups: {} | Backpressure retries: {}",
+                                stats.worker_wakeups, stats.budget_followups, stats.output_backpressure_retries,
+                            ));
+                            ui.label(format!(
+                                "Processed: {} bytes | Last/max update: {}/{} bytes",
+                                stats.processed_bytes, stats.last_update_bytes, stats.max_update_bytes,
+                            ));
+                            ui.label(format!(
+                                "Max poll/chunk/parse slice: {:.3}/{:.3}/{:.3} ms",
+                                stats.max_poll_duration.as_secs_f64() * 1_000.0,
+                                stats.max_chunk_duration.as_secs_f64() * 1_000.0,
+                                stats.max_parse_duration.as_secs_f64() * 1_000.0,
+                            ));
+                            ui.label(format!(
+                                "Delivered user inputs: {} | Last/max delivery latency: {:.3}/{:.3} ms | Last delivery: {:.3} s after session start",
+                                stats.delivered_inputs,
+                                stats.last_input_latency.as_secs_f64() * 1_000.0,
+                                stats.max_input_latency.as_secs_f64() * 1_000.0,
+                                stats.last_input_delivered_at.as_secs_f64(),
+                            ));
+                        }
+                    }
+                });
             }
             ui.separator();
-            if let Some(session) = self.session.as_mut()
-                && let Err(error) = self.surface.show(ui, session)
-            {
-                self.interaction_error = Some(format!("Terminal interaction failed: {error:#}"));
-                ui.ctx().request_repaint();
-            }
+            self.workspace.show(ui);
         });
     }
 }
@@ -180,9 +155,7 @@ impl eframe::App for VastermApp {
     fn logic(&mut self, _context: &egui::Context, _frame: &mut eframe::Frame) {
         let start = Instant::now();
         self.diagnostics.logic_passes = self.diagnostics.logic_passes.saturating_add(1);
-        if let Some(session) = self.session.as_mut() {
-            session.poll();
-        }
+        self.workspace.poll();
         self.diagnostics.max_logic_duration =
             self.diagnostics.max_logic_duration.max(start.elapsed());
     }
@@ -195,17 +168,15 @@ impl eframe::App for VastermApp {
     }
 
     fn on_exit(&mut self) {
-        if let Some(session) = self.session.as_mut()
-            && !session.cleanup_complete()
-        {
-            session.request_shutdown();
-        }
+        self.workspace.request_shutdown_all();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::{GridSize, SessionState};
+    use std::sync::Arc;
     use std::thread;
 
     fn wait_for(session: &mut Session, ready: impl Fn(&Session) -> bool) {
@@ -259,7 +230,7 @@ mod tests {
                 focused,
                 ..Default::default()
             };
-            let mut output = context.run_ui(raw, |ui| surface.show(ui, session).unwrap());
+            let mut output = context.run_ui(raw, |ui| surface.show(ui, session, 0, true).unwrap());
             output.textures_delta.clear();
         };
         frame(&mut session, vec![], true);
@@ -342,34 +313,25 @@ mod tests {
         wait_for(&mut session, |session| {
             matches!(session.state(), SessionState::Running { .. })
         });
-        let mut app = VastermApp {
-            session: Some(session),
-            startup_error: None,
-            surface: Default::default(),
-            interaction_error: None,
-            diagnostics: UiDiagnostics::default(),
-            closing_window: false,
-        };
+        let mut app = VastermApp::with_single_session(session, false);
         let mut output = context.run_ui(egui::RawInput::default(), |ui| app.show(ui));
         output.textures_delta.clear();
         assert!(output.shapes.iter().any(|shape| {
             matches!(&shape.shape, egui::epaint::Shape::Text(text)
                 if text.galley.text() == "Load diagnostics")
         }));
-        app.session.as_mut().unwrap().shutdown().unwrap();
+        app.workspace.panes[0]
+            .session
+            .as_mut()
+            .unwrap()
+            .shutdown()
+            .unwrap();
     }
 
     #[test]
     fn startup_failure_is_visible_in_the_ui() {
         let context = egui::Context::default();
-        let mut app = VastermApp {
-            session: None,
-            startup_error: Some("test shell could not start".into()),
-            surface: Default::default(),
-            interaction_error: None,
-            diagnostics: UiDiagnostics::default(),
-            closing_window: false,
-        };
+        let mut app = VastermApp::with_startup_error("test shell could not start".into());
         let mut output = context.run_ui(egui::RawInput::default(), |ui| app.show(ui));
         // This headless test inspects paint output without uploading textures.
         output.textures_delta.clear();
@@ -400,14 +362,7 @@ mod tests {
             Arc::new(|| {}),
         )
         .unwrap();
-        let mut app = VastermApp {
-            session: Some(session),
-            startup_error: None,
-            surface: Default::default(),
-            interaction_error: None,
-            diagnostics: Default::default(),
-            closing_window: false,
-        };
+        let mut app = VastermApp::with_single_session(session, false);
         let mut output = context.run_ui(close_input(), |ui| app.show(ui));
         output.textures_delta.clear();
         assert!(
@@ -416,7 +371,10 @@ mod tests {
                 .contains(&egui::ViewportCommand::CancelClose)
         );
         assert!(app.closing_window);
-        wait_for(app.session.as_mut().unwrap(), Session::cleanup_complete);
+        wait_for(
+            app.workspace.panes[0].session.as_mut().unwrap(),
+            Session::cleanup_complete,
+        );
         let mut output = context.run_ui(egui::RawInput::default(), |ui| app.show(ui));
         output.textures_delta.clear();
         assert!(
@@ -436,19 +394,17 @@ mod tests {
             Arc::new(|| {}),
         )
         .unwrap();
-        let mut app = VastermApp {
-            session: Some(session),
-            startup_error: None,
-            surface: Default::default(),
-            interaction_error: None,
-            diagnostics: Default::default(),
-            closing_window: false,
-        };
+        let mut app = VastermApp::with_single_session(session, false);
         let mut output = context.run_ui(close_input(), |ui| app.show(ui));
         output.textures_delta.clear();
         let deadline = Instant::now() + Duration::from_secs(3);
-        while !app.session.as_ref().unwrap().cleanup_complete() {
-            app.session.as_mut().unwrap().poll();
+        while !app.workspace.panes[0]
+            .session
+            .as_ref()
+            .unwrap()
+            .cleanup_complete()
+        {
+            app.workspace.panes[0].session.as_mut().unwrap().poll();
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(5));
         }
@@ -472,6 +428,203 @@ mod tests {
             !output.viewport_output[&egui::ViewportId::ROOT]
                 .commands
                 .contains(&egui::ViewportCommand::CancelClose)
+        );
+    }
+
+    #[test]
+    fn two_panes_spawn_and_run_independently() {
+        let context = egui::Context::default();
+        let session1 = Session::spawn(
+            portable_pty::CommandBuilder::new("/bin/cat"),
+            GridSize::default(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let session2 = Session::spawn(
+            portable_pty::CommandBuilder::new("/bin/cat"),
+            GridSize::default(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let mut app = VastermApp::from_workspace(Workspace::from_panes(vec![
+            Pane::with_session(PaneId(0), session1),
+            Pane::with_session(PaneId(1), session2),
+        ]));
+        wait_for(app.workspace.panes[0].session.as_mut().unwrap(), |s| {
+            matches!(s.state(), SessionState::Running { .. })
+        });
+        wait_for(app.workspace.panes[1].session.as_mut().unwrap(), |s| {
+            matches!(s.state(), SessionState::Running { .. })
+        });
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = context.run_ui(raw, |ui| app.show(ui));
+        output.textures_delta.clear();
+        assert_eq!(app.workspace.panes.len(), 2);
+        assert!(matches!(
+            app.workspace.panes[0].session.as_ref().unwrap().state(),
+            SessionState::Running { .. }
+        ));
+        assert!(matches!(
+            app.workspace.panes[1].session.as_ref().unwrap().state(),
+            SessionState::Running { .. }
+        ));
+        assert!(
+            app.workspace.panes[0]
+                .session
+                .as_ref()
+                .unwrap()
+                .size()
+                .columns()
+                > 10
+        );
+        assert!(
+            app.workspace.panes[1]
+                .session
+                .as_ref()
+                .unwrap()
+                .size()
+                .columns()
+                > 10
+        );
+        app.workspace.request_shutdown_all();
+        wait_for(
+            app.workspace.panes[0].session.as_mut().unwrap(),
+            Session::cleanup_complete,
+        );
+        wait_for(
+            app.workspace.panes[1].session.as_mut().unwrap(),
+            Session::cleanup_complete,
+        );
+    }
+
+    #[test]
+    fn native_close_waits_for_all_sessions_to_finish_cleanup() {
+        let context = egui::Context::default();
+        let session1 = Session::spawn(
+            portable_pty::CommandBuilder::new("/bin/cat"),
+            GridSize::default(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let session2 = Session::spawn(
+            portable_pty::CommandBuilder::new("/bin/cat"),
+            GridSize::default(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let mut app = VastermApp::from_workspace(Workspace::from_panes(vec![
+            Pane::with_session(PaneId(0), session1),
+            Pane::with_session(PaneId(1), session2),
+        ]));
+        let mut output = context.run_ui(close_input(), |ui| app.show(ui));
+        output.textures_delta.clear();
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        assert!(app.closing_window);
+
+        wait_for(
+            app.workspace.panes[0].session.as_mut().unwrap(),
+            Session::cleanup_complete,
+        );
+        wait_for(
+            app.workspace.panes[1].session.as_mut().unwrap(),
+            Session::cleanup_complete,
+        );
+
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| app.show(ui));
+        output.textures_delta.clear();
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Close)
+        );
+        assert!(!app.closing_window);
+    }
+
+    #[test]
+    fn window_resize_resizes_both_panes_independently() {
+        let context = egui::Context::default();
+        let session1 = Session::spawn(
+            portable_pty::CommandBuilder::new("/bin/cat"),
+            GridSize::default(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let session2 = Session::spawn(
+            portable_pty::CommandBuilder::new("/bin/cat"),
+            GridSize::default(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let mut app = VastermApp::from_workspace(Workspace::from_panes(vec![
+            Pane::with_session(PaneId(0), session1),
+            Pane::with_session(PaneId(1), session2),
+        ]));
+
+        let raw1 = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = context.run_ui(raw1, |ui| app.show(ui));
+        output.textures_delta.clear();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.workspace.panes[0].session.as_ref().unwrap().size() == GridSize::default()
+            || app.workspace.panes[1].session.as_ref().unwrap().size() == GridSize::default()
+        {
+            app.workspace.poll();
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        let size1_p0 = app.workspace.panes[0].session.as_ref().unwrap().size();
+        let size1_p1 = app.workspace.panes[1].session.as_ref().unwrap().size();
+
+        let raw2 = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = context.run_ui(raw2, |ui| app.show(ui));
+        output.textures_delta.clear();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.workspace.panes[0].session.as_ref().unwrap().size() == size1_p0
+            || app.workspace.panes[1].session.as_ref().unwrap().size() == size1_p1
+        {
+            app.workspace.poll();
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        let size2_p0 = app.workspace.panes[0].session.as_ref().unwrap().size();
+        let size2_p1 = app.workspace.panes[1].session.as_ref().unwrap().size();
+
+        assert!(size2_p0.columns() > size1_p0.columns());
+        assert!(size2_p1.columns() > size1_p1.columns());
+        assert!(size2_p0.rows() > size1_p0.rows());
+        assert!(size2_p1.rows() > size1_p1.rows());
+
+        app.workspace.request_shutdown_all();
+        wait_for(
+            app.workspace.panes[0].session.as_mut().unwrap(),
+            Session::cleanup_complete,
+        );
+        wait_for(
+            app.workspace.panes[1].session.as_mut().unwrap(),
+            Session::cleanup_complete,
         );
     }
 }

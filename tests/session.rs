@@ -414,7 +414,7 @@ fn saturated_output_budget_continues_without_a_polling_timer() {
     let mut session = fixture_with_wakeup("numbered-output", GridSize::default(), wakeup);
     // Keep the UI asleep until output backpressure proves a real queued backlog.
     let deadline = Instant::now() + Duration::from_secs(5);
-    while session.diagnostics().output_backpressure_retries == 0 {
+    while session.diagnostics().output_backpressure_retries < 5 {
         assert!(Instant::now() < deadline);
         thread::sleep(Duration::from_millis(5));
     }

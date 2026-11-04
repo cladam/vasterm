@@ -59,7 +59,13 @@ impl Metrics {
 }
 
 impl TerminalSurface {
-    pub fn show(&mut self, ui: &mut egui::Ui, session: &mut Session) -> Result<()> {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        session: &mut Session,
+        id_source: impl std::hash::Hash + std::fmt::Debug,
+        default_focus: bool,
+    ) -> Result<()> {
         let font = FontId::monospace(14.0);
         let cell = ui
             .fonts_mut(|fonts| egui::vec2(fonts.glyph_width(&font, 'M'), fonts.row_height(&font)));
@@ -67,7 +73,7 @@ impl TerminalSurface {
         let (_, allocated) = ui.allocate_space(ui.available_size());
         let response = ui.interact(
             allocated,
-            ui.make_persistent_id("terminal-surface"),
+            ui.make_persistent_id(("terminal-surface", id_source)),
             egui::Sense::click(),
         );
         let scale = metrics.pixels_per_point;
@@ -80,9 +86,14 @@ impl TerminalSurface {
             (allocated.bottom() * scale).floor() / scale,
         );
         let rect = Rect::from_min_max(min, max.max(min));
-        if !self.initialized || response.clicked() {
-            response.request_focus();
+        if !self.initialized {
+            if default_focus {
+                response.request_focus();
+            }
             self.initialized = true;
+            ui.ctx().request_repaint();
+        } else if response.clicked() {
+            response.request_focus();
             ui.ctx().request_repaint();
         }
         let focused = response.has_focus() && ui.input(|input| input.focused);
