@@ -191,7 +191,12 @@ mod tests {
                 "{}",
                 session.state()
             );
-            assert!(Instant::now() < deadline, "timed out: {}", session.state());
+            assert!(
+                Instant::now() < deadline,
+                "timed out: {}; grid: {:?}",
+                session.state(),
+                screen(session)
+            );
             thread::sleep(Duration::from_millis(5));
         }
     }
@@ -230,7 +235,11 @@ mod tests {
                 focused,
                 ..Default::default()
             };
-            let mut output = context.run_ui(raw, |ui| surface.show(ui, session, 0, true).unwrap());
+            let mut output = context.run_ui(raw, |ui| {
+                surface
+                    .show(ui, session, egui::Id::unique("terminal-surface"), true)
+                    .unwrap()
+            });
             output.textures_delta.clear();
         };
         frame(&mut session, vec![], true);
@@ -616,6 +625,379 @@ mod tests {
         assert!(size2_p1.columns() > size1_p1.columns());
         assert!(size2_p0.rows() > size1_p0.rows());
         assert!(size2_p1.rows() > size1_p1.rows());
+
+        app.workspace.request_shutdown_all();
+        wait_for(
+            app.workspace.panes[0].session.as_mut().unwrap(),
+            Session::cleanup_complete,
+        );
+        wait_for(
+            app.workspace.panes[1].session.as_mut().unwrap(),
+            Session::cleanup_complete,
+        );
+    }
+    #[test]
+    fn two_panes_isolate_text_ime_meta_navigation_and_interrupts() {
+        use egui::{Event, ImeEvent, Key, Modifiers};
+        use portable_pty::CommandBuilder;
+
+        let expected_p0 = b"a\xc3\xa9\x03\x1bOA\r\x7f\t\x1b\x1bOH\x1bOF\x1bb\x1bf\x04";
+        let mut command0 = CommandBuilder::new("/bin/sh");
+        command0.args([
+            "-c",
+            &format!(
+                "stty raw -echo; printf '\\033[2J\\033[H\\033[?1hREADY0'; \
+             received=$(dd bs=1 count={} 2>/dev/null | od -An -tx1 | tr -d ' \\n'); \
+             printf '\\r\\nINPUT0:%s' \"$received\"",
+                expected_p0.len()
+            ),
+        ]);
+        let session0 = Session::spawn(command0, GridSize::default(), Arc::new(|| {})).unwrap();
+
+        let expected_p1 = b"z\xc3\xa8\x03\x04";
+        let mut command1 = CommandBuilder::new("/bin/sh");
+        command1.args([
+            "-c",
+            &format!(
+                "stty raw -echo; printf '\\033[2J\\033[H\\033[?1hREADY1'; \
+             received=$(dd bs=1 count={} 2>/dev/null | od -An -tx1 | tr -d ' \\n'); \
+             printf '\\r\\nINPUT1:%s' \"$received\"",
+                expected_p1.len()
+            ),
+        ]);
+        let session1 = Session::spawn(command1, GridSize::default(), Arc::new(|| {})).unwrap();
+
+        let mut app = VastermApp::from_workspace(Workspace::from_panes(vec![
+            Pane::with_session(PaneId(0), session0),
+            Pane::with_session(PaneId(1), session1),
+        ]));
+
+        wait_for(app.workspace.panes[0].session.as_mut().unwrap(), |s| {
+            screen(s).contains("READY0")
+        });
+        wait_for(app.workspace.panes[1].session.as_mut().unwrap(), |s| {
+            screen(s).contains("READY1")
+        });
+
+        let context = egui::Context::default();
+        let screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1200.0, 800.0),
+        ));
+
+        // Initialize app and settle initial focus.
+        let raw = egui::RawInput {
+            focused: true,
+            screen_rect,
+            ..Default::default()
+        };
+        let mut output = context.run_ui(raw.clone(), |ui| app.show(ui));
+        output.textures_delta.clear();
+        let mut output = context.run_ui(raw, |ui| app.show(ui));
+        output.textures_delta.clear();
+
+        let p0_surface_id = app.workspace.panes[0].surface_id();
+        let p1_surface_id = app.workspace.panes[1].surface_id();
+
+        assert!(
+            context.memory(|m| m.has_focus(p0_surface_id)),
+            "Pane 0 must have initial focus"
+        );
+        assert!(
+            !context.memory(|m| m.has_focus(p1_surface_id)),
+            "Pane 1 must not have initial focus"
+        );
+
+        // Deliver text, IME, interrupt, navigation, and Meta keys to Pane 0.
+        let key = |key, modifiers| Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let p0_events = vec![
+            key(Key::A, Modifiers::NONE),
+            Event::Text("a".into()),
+            Event::Ime(ImeEvent::Preedit {
+                text: "candidate".into(),
+                active_range_chars: None,
+            }),
+            Event::Ime(ImeEvent::Commit("é".into())),
+            key(Key::C, Modifiers::CTRL),
+            key(Key::ArrowUp, Modifiers::NONE),
+            key(Key::Enter, Modifiers::NONE),
+            key(Key::Backspace, Modifiers::NONE),
+            key(Key::Tab, Modifiers::NONE),
+            key(Key::Escape, Modifiers::NONE),
+            key(Key::Home, Modifiers::NONE),
+            key(Key::End, Modifiers::NONE),
+            key(Key::AltLeft, Modifiers::ALT),
+            key(Key::B, Modifiers::ALT),
+            Event::Text("b".into()),
+            key(Key::F, Modifiers::ALT),
+            Event::Text("f".into()),
+            Event::Key {
+                key: Key::AltLeft,
+                physical_key: Some(Key::AltLeft),
+                pressed: false,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            },
+            key(Key::D, Modifiers::CTRL),
+        ];
+
+        let raw = egui::RawInput {
+            events: p0_events,
+            focused: true,
+            screen_rect,
+            ..Default::default()
+        };
+        let mut output = context.run_ui(raw, |ui| app.show(ui));
+        output.textures_delta.clear();
+
+        wait_for(app.workspace.panes[0].session.as_mut().unwrap(), |s| {
+            matches!(s.state(), SessionState::Exited(_))
+        });
+
+        let hex_p0: String = expected_p0.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(
+            screen(app.workspace.panes[0].session.as_ref().unwrap())
+                .contains(&format!("INPUT0:{hex_p0}")),
+            "{}",
+            screen(app.workspace.panes[0].session.as_ref().unwrap())
+        );
+
+        // Assert zero bytes leaked to Pane 1: Pane 1 is still running and waiting for input.
+        assert!(matches!(
+            app.workspace.panes[1].session.as_ref().unwrap().state(),
+            SessionState::Running { .. }
+        ));
+        assert!(
+            !screen(app.workspace.panes[1].session.as_ref().unwrap()).contains("INPUT1:"),
+            "Pane 1 must not have received any leaked input: {}",
+            screen(app.workspace.panes[1].session.as_ref().unwrap())
+        );
+        // Switch focus to Pane 1 by clicking on Pane 1.
+        let click_pos = egui::pos2(900.0, 400.0);
+        let raw = egui::RawInput {
+            events: vec![
+                Event::PointerMoved(click_pos),
+                Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+                Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+            focused: true,
+            screen_rect,
+            ..Default::default()
+        };
+        let mut output = context.run_ui(raw, |ui| app.show(ui));
+        output.textures_delta.clear();
+
+        assert!(
+            context.memory(|m| m.has_focus(p1_surface_id)),
+            "Pane 1 must be focused after click"
+        );
+        assert!(
+            !context.memory(|m| m.has_focus(p0_surface_id)),
+            "Pane 0 must no longer have focus"
+        );
+
+        // Deliver input to Pane 1.
+        let p1_events = vec![
+            key(Key::Z, Modifiers::NONE),
+            Event::Text("z".into()),
+            Event::Ime(ImeEvent::Preedit {
+                text: "candidate".into(),
+                active_range_chars: None,
+            }),
+            Event::Ime(ImeEvent::Commit("è".into())),
+            key(Key::C, Modifiers::CTRL),
+            key(Key::D, Modifiers::CTRL),
+        ];
+        let raw = egui::RawInput {
+            events: p1_events,
+            focused: true,
+            screen_rect,
+            ..Default::default()
+        };
+        let mut output = context.run_ui(raw, |ui| app.show(ui));
+        output.textures_delta.clear();
+
+        wait_for(app.workspace.panes[1].session.as_mut().unwrap(), |s| {
+            matches!(s.state(), SessionState::Exited(_))
+        });
+
+        let hex_p1: String = expected_p1.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(
+            screen(app.workspace.panes[1].session.as_ref().unwrap())
+                .contains(&format!("INPUT1:{hex_p1}")),
+            "{}",
+            screen(app.workspace.panes[1].session.as_ref().unwrap())
+        );
+
+        app.workspace.request_shutdown_all();
+        wait_for(
+            app.workspace.panes[0].session.as_mut().unwrap(),
+            Session::cleanup_complete,
+        );
+        wait_for(
+            app.workspace.panes[1].session.as_mut().unwrap(),
+            Session::cleanup_complete,
+        );
+    }
+    #[test]
+    fn clicking_pane_switches_focus_and_updates_visual_cues() {
+        use egui::{Event, Modifiers, PointerButton, Pos2};
+        use portable_pty::CommandBuilder;
+
+        let context = egui::Context::default();
+        let session0 = Session::spawn(
+            CommandBuilder::new("/bin/cat"),
+            GridSize::default(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+        let session1 = Session::spawn(
+            CommandBuilder::new("/bin/cat"),
+            GridSize::default(),
+            Arc::new(|| {}),
+        )
+        .unwrap();
+
+        let mut app = VastermApp::from_workspace(Workspace::from_panes(vec![
+            Pane::with_session(PaneId(0), session0),
+            Pane::with_session(PaneId(1), session1),
+        ]));
+
+        wait_for(app.workspace.panes[0].session.as_mut().unwrap(), |s| {
+            matches!(s.state(), SessionState::Running { .. })
+        });
+        wait_for(app.workspace.panes[1].session.as_mut().unwrap(), |s| {
+            matches!(s.state(), SessionState::Running { .. })
+        });
+
+        let screen_rect = Some(egui::Rect::from_min_size(
+            Pos2::ZERO,
+            egui::vec2(1200.0, 800.0),
+        ));
+
+        let p0_surface_id = app.workspace.panes[0].surface_id();
+        let p1_surface_id = app.workspace.panes[1].surface_id();
+
+        // Frame 1: Initial display. Pane 0 has default focus.
+        let raw1 = egui::RawInput {
+            focused: true,
+            screen_rect,
+            ..Default::default()
+        };
+        let mut output1 = context.run_ui(raw1.clone(), |ui| app.show(ui));
+        output1.textures_delta.clear();
+        let mut output1 = context.run_ui(raw1, |ui| app.show(ui));
+        output1.textures_delta.clear();
+
+        assert!(context.memory(|m| m.has_focus(p0_surface_id)));
+        assert!(!context.memory(|m| m.has_focus(p1_surface_id)));
+
+        let (selection_color, noninteractive_color) = context.options(|o| {
+            (
+                o.dark_style.visuals.selection.bg_fill,
+                o.dark_style.visuals.widgets.noninteractive.bg_stroke.color,
+            )
+        });
+        let has_active_stroke = output1.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::epaint::Shape::Rect(rect)
+                if rect.stroke.width == 2.0 && rect.stroke.color == selection_color)
+        });
+        let has_inactive_stroke = output1.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::epaint::Shape::Rect(rect)
+                if rect.stroke.width == 1.0 && rect.stroke.color == noninteractive_color)
+        });
+        assert!(
+            has_active_stroke,
+            "Pane 0 should have active selection border stroke"
+        );
+        assert!(
+            has_inactive_stroke,
+            "Pane 1 should have inactive border stroke"
+        );
+
+        // Frame 2: Click on Pane 1 (e.g. at (900.0, 400.0)).
+        let click_p1 = egui::pos2(900.0, 400.0);
+        let raw2 = egui::RawInput {
+            events: vec![
+                Event::PointerMoved(click_p1),
+                Event::PointerButton {
+                    pos: click_p1,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+                Event::PointerButton {
+                    pos: click_p1,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+            focused: true,
+            screen_rect,
+            ..Default::default()
+        };
+        let mut output2 = context.run_ui(raw2, |ui| app.show(ui));
+        output2.textures_delta.clear();
+
+        assert!(
+            context.memory(|m| m.has_focus(p1_surface_id)),
+            "Pane 1 must have focus after click"
+        );
+        assert!(
+            !context.memory(|m| m.has_focus(p0_surface_id)),
+            "Pane 0 must lose focus"
+        );
+
+        // Frame 3: Click back on Pane 0 (e.g. at (300.0, 400.0)).
+        let click_p0 = egui::pos2(300.0, 400.0);
+        let raw3 = egui::RawInput {
+            events: vec![
+                Event::PointerMoved(click_p0),
+                Event::PointerButton {
+                    pos: click_p0,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+                Event::PointerButton {
+                    pos: click_p0,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+            focused: true,
+            screen_rect,
+            ..Default::default()
+        };
+        let mut output3 = context.run_ui(raw3, |ui| app.show(ui));
+        output3.textures_delta.clear();
+
+        assert!(
+            context.memory(|m| m.has_focus(p0_surface_id)),
+            "Pane 0 must have focus after clicking back"
+        );
+        assert!(
+            !context.memory(|m| m.has_focus(p1_surface_id)),
+            "Pane 1 must lose focus"
+        );
 
         app.workspace.request_shutdown_all();
         wait_for(

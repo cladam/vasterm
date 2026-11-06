@@ -63,7 +63,7 @@ impl TerminalSurface {
         &mut self,
         ui: &mut egui::Ui,
         session: &mut Session,
-        id_source: impl std::hash::Hash + std::fmt::Debug,
+        surface_id: egui::Id,
         default_focus: bool,
     ) -> Result<()> {
         let font = FontId::monospace(14.0);
@@ -71,11 +71,7 @@ impl TerminalSurface {
             .fonts_mut(|fonts| egui::vec2(fonts.glyph_width(&font, 'M'), fonts.row_height(&font)));
         let metrics = Metrics::new(cell, ui.ctx().pixels_per_point());
         let (_, allocated) = ui.allocate_space(ui.available_size());
-        let response = ui.interact(
-            allocated,
-            ui.make_persistent_id(("terminal-surface", id_source)),
-            egui::Sense::click(),
-        );
+        let response = ui.interact(allocated, surface_id, egui::Sense::click());
         let scale = metrics.pixels_per_point;
         let min = egui::pos2(
             (allocated.left() * scale).ceil() / scale,
@@ -89,11 +85,35 @@ impl TerminalSurface {
         if !self.initialized {
             if default_focus {
                 response.request_focus();
+                ui.memory_mut(|memory| {
+                    memory.set_focus_lock_filter(
+                        response.id,
+                        egui::EventFilter {
+                            tab: true,
+                            horizontal_arrows: true,
+                            vertical_arrows: true,
+                            escape: true,
+                        },
+                    )
+                });
             }
             self.initialized = true;
             ui.ctx().request_repaint();
-        } else if response.clicked() {
+        } else if response.clicked()
+            || (response.hovered() && ui.input(|i| i.pointer.any_pressed()))
+        {
             response.request_focus();
+            ui.memory_mut(|memory| {
+                memory.set_focus_lock_filter(
+                    response.id,
+                    egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    },
+                )
+            });
             ui.ctx().request_repaint();
         }
         let focused = response.has_focus() && ui.input(|input| input.focused);

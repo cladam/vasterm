@@ -8,6 +8,12 @@ use crate::surface::TerminalSurface;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PaneId(pub usize);
 
+impl PaneId {
+    pub fn surface_id(self) -> egui::Id {
+        egui::Id::unique(("terminal-surface", self.0))
+    }
+}
+
 impl std::fmt::Display for PaneId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0 + 1)
@@ -70,8 +76,8 @@ impl Pane {
         }
     }
 
-    pub fn surface_id(&self, ui: &egui::Ui) -> egui::Id {
-        ui.make_persistent_id(("terminal-surface", self.id.0))
+    pub fn surface_id(&self) -> egui::Id {
+        self.id.surface_id()
     }
 
     pub fn poll(&mut self) {
@@ -95,16 +101,25 @@ impl Pane {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, default_focus: bool) {
+        let surface_id = self.surface_id();
         if let Some(error) = &self.startup_error {
             ui.colored_label(egui::Color32::LIGHT_RED, format!("Session failed: {error}"));
         }
         if let Some(session) = self.session.as_mut() {
+            let is_focused = ui.memory(|m| m.has_focus(surface_id)) && ui.input(|i| i.focused);
             let color = if matches!(session.state(), SessionState::Failed(_)) {
                 egui::Color32::LIGHT_RED
             } else {
                 ui.visuals().text_color()
             };
-            ui.horizontal(|ui| {
+            let header = ui.horizontal(|ui| {
+                let title = egui::RichText::new(format!("Pane {}", self.id)).strong();
+                let title = if is_focused {
+                    title.color(ui.visuals().selection.bg_fill)
+                } else {
+                    title
+                };
+                ui.label(title);
                 ui.colored_label(color, session.state().to_string());
                 ui.label(format!(
                     "{} x {} | {:.2} px/point",
@@ -124,6 +139,12 @@ impl Pane {
                     self.interaction_error = None;
                 }
             });
+            if header.response.clicked()
+                || (header.response.hovered() && ui.input(|i| i.pointer.any_pressed()))
+            {
+                ui.ctx().memory_mut(|m| m.request_focus(surface_id));
+                ui.ctx().request_repaint();
+            }
         }
         if let Some(error) = &self.interaction_error {
             ui.colored_label(egui::Color32::LIGHT_RED, error);
@@ -133,7 +154,7 @@ impl Pane {
         }
         ui.separator();
         if let Some(session) = self.session.as_mut()
-            && let Err(error) = self.surface.show(ui, session, self.id.0, default_focus)
+            && let Err(error) = self.surface.show(ui, session, surface_id, default_focus)
         {
             self.interaction_error = Some(format!("Terminal interaction failed: {error:#}"));
             ui.ctx().request_repaint();
@@ -199,12 +220,12 @@ impl Workspace {
 
         let full_rect = ui.available_rect_before_wrap();
         if count == 1 {
-            let surface_id = self.panes[0].surface_id(ui);
+            let surface_id = self.panes[0].surface_id();
             let is_focused = ui.memory(|m| m.has_focus(surface_id)) && ui.input(|i| i.focused);
             let stroke = if is_focused {
-                egui::Stroke::new(1.5, ui.visuals().selection.bg_fill)
+                egui::Stroke::new(2.0, ui.visuals().selection.bg_fill)
             } else {
-                ui.visuals().widgets.noninteractive.bg_stroke
+                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
             };
             ui.painter()
                 .rect_stroke(full_rect, 2.0, stroke, egui::StrokeKind::Inside);
@@ -233,12 +254,12 @@ impl Workspace {
                 egui::vec2(pane_width, full_rect.height()),
             );
 
-            let surface_id = self.panes[i].surface_id(ui);
+            let surface_id = self.panes[i].surface_id();
             let is_focused = ui.memory(|m| m.has_focus(surface_id)) && ui.input(|i| i.focused);
             let stroke = if is_focused {
-                egui::Stroke::new(1.5, ui.visuals().selection.bg_fill)
+                egui::Stroke::new(2.0, ui.visuals().selection.bg_fill)
             } else {
-                ui.visuals().widgets.noninteractive.bg_stroke
+                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
             };
             ui.painter()
                 .rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
